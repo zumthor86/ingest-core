@@ -1,0 +1,30 @@
+[project]
+name = "ingest-core"
+version = "0.1.0"
+description = "Shared market-data acquisition plumbing for Hermes and Hephaestus: provider clients (EODHD, Barchart), in-process rate limiting, retry/backoff, trading-calendar/gap-detection. Orchestration-agnostic and storage-agnostic by design."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests",
+    "polars",
+    "pandas",
+    "pandas-market-calendars",
+    "holidays",
+]
+
+# Deliberately absent (FR-003): prefect, sqlalchemy, psycopg, pyarrow write paths —
+# this library owns no scheduling and no storage.
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["ingest_core*"]
