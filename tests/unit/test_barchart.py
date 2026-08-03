@@ -9,9 +9,9 @@ import pytest
 from ingest_core.clients.barchart import (
     _apply_symbol_mappings,
     _file_date,
-    _parse_barchart_date,
-    _parse_barchart_value,
     get_top_symbols,
+    parse_barchart_date,
+    parse_barchart_value,
 )
 
 
@@ -50,17 +50,17 @@ def test_file_date():
 
 
 def test_parse_barchart_value():
-    assert _parse_barchart_value("12.83%") == pytest.approx(0.1283)
-    assert _parse_barchart_value("2,123,529") == 2123529.0
-    assert _parse_barchart_value("-") is None
-    assert _parse_barchart_value(None) is None
-    assert _parse_barchart_value("unch") is None
+    assert parse_barchart_value("12.83%") == pytest.approx(0.1283)
+    assert parse_barchart_value("2,123,529") == 2123529.0
+    assert parse_barchart_value("-") is None
+    assert parse_barchart_value(None) is None
+    assert parse_barchart_value("unch") is None
 
 
 def test_parse_barchart_date():
-    assert _parse_barchart_date("2026-03-13") == date(2026, 3, 13)
-    assert _parse_barchart_date("3/13/2026") == date(2026, 3, 13)
-    assert _parse_barchart_date("N/A") is None
+    assert parse_barchart_date("2026-03-13") == date(2026, 3, 13)
+    assert parse_barchart_date("3/13/2026") == date(2026, 3, 13)
+    assert parse_barchart_date("N/A") is None
 
 
 def test_apply_symbol_mappings_injected_dict():

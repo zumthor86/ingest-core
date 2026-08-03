@@ -360,7 +360,7 @@ def _rename_r1000_columns(df: pl.DataFrame) -> pl.DataFrame:
     return out.select(ordered_columns + remaining_columns)
 
 
-def _parse_barchart_value(raw: Any) -> Optional[float]:
+def parse_barchart_value(raw: Any) -> Optional[float]:
     """Parse a Barchart display value to float.
 
     Handles ``"12.83%"`` → ``0.1283``, ``"2,123,529"`` → ``2123529.0``,
@@ -382,7 +382,7 @@ def _parse_barchart_value(raw: Any) -> Optional[float]:
     return v / 100.0 if is_pct else v
 
 
-def _parse_barchart_date(raw: Any) -> Optional[date]:
+def parse_barchart_date(raw: Any) -> Optional[date]:
     """Parse Barchart date strings (typically ``YYYY-MM-DD`` or ``M/D/YYYY``)."""
     if raw is None:
         return None

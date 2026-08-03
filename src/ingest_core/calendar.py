@@ -7,7 +7,7 @@ by *resolved* calendar objects (a ``pandas_market_calendars`` calendar and/or a
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Optional
 
 import pandas as pd
@@ -269,6 +269,58 @@ def get_early_close_sessions_set(
         tz = getattr(calendar, "tz", "America/New_York")
         local_close = schedule["market_close"].dt.tz_convert(tz)
         return {ts.date() for ts, hour in zip(schedule.index, local_close.dt.hour) if hour < 16}
+
+
+def last_completed_session(
+    as_of: Optional[datetime] = None,
+    exchange: str = "NYSE",
+    close_buffer_minutes: int = 0,
+) -> date:
+    """Most recent exchange session that has actually **closed** as of ``as_of``.
+
+    A plain "latest trading day" lookup (schedule ``on or before today``) returns
+    *today* the instant today qualifies as a session — even mid-morning, before the
+    exchange has opened, let alone closed. That silently breaks any same-day,
+    intraday trigger of a pipeline stage expecting the just-completed session's
+    EOD data: the provider cannot possibly have it yet, so a coverage/readiness
+    check keyed on "today" reads 0% and fails every time it's tried, for as long
+    as the market stays open (observed 2026-07-06: a manual ``hermes-ingest``
+    trigger during market hours failed 3 retries in a row on
+    ``eod_prices=0.0``, because the gate expected today's close as this ran).
+
+    This resolves "latest trading day" as *last completed session* instead: if
+    ``as_of`` falls before today's close (plus ``close_buffer_minutes`` — a small
+    margin for the provider's own settle/posting lag), the **prior** session is
+    returned; only once the current session has actually closed does "today"
+    become the answer.
+
+    ``close_buffer_minutes`` defaults to 0 (session-closed is sufficient); pass a
+    larger value to also wait out a known vendor posting delay.
+    """
+    now = as_of if as_of is not None else datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    anchor_date = now.date()
+
+    calendar = _get_calendar(exchange)
+    schedule = calendar.schedule(
+        start_date=(anchor_date - timedelta(days=10)).isoformat(),
+        end_date=anchor_date.isoformat(),
+    )
+    if schedule.empty:
+        raise RuntimeError(f"no {exchange} sessions found in the 10 days up to {anchor_date}")
+
+    last_session_date = schedule.index[-1].date()
+    if last_session_date == anchor_date:
+        close_cutoff = schedule["market_close"].iloc[-1] + timedelta(minutes=close_buffer_minutes)
+        if now < close_cutoff:
+            if len(schedule) < 2:
+                raise RuntimeError(
+                    f"only one {exchange} session found in the 10 days up to {anchor_date}; "
+                    "cannot fall back to a prior completed session"
+                )
+            return schedule.index[-2].date()  # today hasn't closed yet -> use the prior close
+    return last_session_date
 
 
 def get_calendar_offset_rows_by_basis(

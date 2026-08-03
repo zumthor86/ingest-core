@@ -42,3 +42,4 @@ library, and mention it in whichever consuming project's `CLAUDE.md` you're also
 updating.
 
 - **2026-07-06** (`d66f110`) — Initial extraction from Hermes + Hephaestus: `clients.eodhd`, `clients.barchart`, `ratelimit`, `calendar`, `retry`, `backfill`, `types`.
+- **2026-07-06** — `ingest_core.calendar` gains `last_completed_session()`: resolves "latest trading day" as the most recently **closed** session, not the still-open "today" — a mid-session intraday trigger of a coverage/readiness gate keyed on "today" previously read 0% and failed until the market closed. `clients.barchart`'s `_parse_barchart_value`/`_parse_barchart_date` are renamed to public (`parse_barchart_value`/`parse_barchart_date`).
