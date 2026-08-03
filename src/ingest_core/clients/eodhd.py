@@ -13,6 +13,13 @@ persistence (FR-003/FR-004). The only intentional behaviour change from the
 sources: the retries-exhausted throttle path raises :class:`EODHDLimitError`
 (a ``RuntimeError`` subclass, so pre-extraction ``except RuntimeError`` call
 sites behave identically).
+
+Failures are typed by what the vendor actually said — :class:`EODHDThrottleError`
+(429, minute window), :class:`EODHDQuotaExhaustedError` (402, daily budget) and
+:class:`EODHDServerError` (5xx, vendor fault). All three subclass
+:class:`EODHDLimitError`, so existing catch sites are unaffected, but callers
+deciding whether work was *deferred* or *failed* must branch on the type — never
+on the message text.
 """
 import logging
 import os
@@ -28,19 +35,141 @@ from typing import Optional, Dict, Any, List
 from urllib.parse import urlencode
 
 from ingest_core.ratelimit import RateLimiter
-from ingest_core.types import EODHDLimitError
+from ingest_core.types import (
+    EODHDLimitError,
+    EODHDQuotaExhaustedError,
+    EODHDServerError,
+    EODHDThrottleError,
+)
 
-# Maximum retries and base delay (seconds) for 429 / 5xx responses.
-# In practice a 429 here is the daily quota wall, not a transient service
-# blip — retrying can't help, so default to ONE retry (was 4) and let the
-# caller treat the failure as deferred work. Env-tunable for burst-throttle
-# environments where waiting does help.
+# Retry budget for HTTP 429 (the per-MINUTE request window). Minute-scale waits,
+# few attempts: if we are pinned against the window the run's own pacing is wrong
+# and the caller is better off deferring than sitting here.
 _MAX_RETRIES = int(os.environ.get("EODHD_HTTP_MAX_RETRIES", "1"))
 _BASE_DELAY = 60.0  # first retry waits ~60 s; doubles each attempt + jitter
+
+# Retry budget for HTTP 5xx, which is a different animal entirely: EODHD documents
+# it as "Server Error — retry after a short delay" and bills it 0 API calls, so
+# retrying is both effective and free. Second-scale waits, more attempts.
+# (Until 2026-07-27 5xx shared the 429 schedule above — one retry after a full
+# 60 s — and was raised as a limit error, so transient vendor faults on the biggest
+# option chains looked like quota exhaustion and were written off as deferred work.)
+_SERVER_ERROR_MAX_RETRIES = int(os.environ.get("EODHD_5XX_MAX_RETRIES", "3"))
+_SERVER_ERROR_BASE_DELAY = float(os.environ.get("EODHD_5XX_BASE_DELAY", "2.0"))
 _PAGE_DELAY = 1.0   # seconds to sleep between paginated requests
-# Published limit: 1000 req/min. Semaphore(15) + 1.0s per-page delay ≈ 900 req/min (10% headroom).
-_MAX_CONCURRENT_REQUESTS = 15
-_api_semaphore = threading.Semaphore(_MAX_CONCURRENT_REQUESTS)
+# Ceiling on in-flight HTTP requests per process, across every caller in this module.
+#
+# Published limit: 1000 req/min. The old fixed value of 15 was justified as
+# "Semaphore(15) + 1.0s per-page delay ≈ 900 req/min", but that arithmetic assumed the
+# per-page sleep dominates. Two things make it wrong in practice: the /contracts path
+# calls fetch_eodhd_page directly and never sleeps, and a real request costs seconds,
+# not milliseconds. Measured on Hephaestus's 473-symbol forward pull (2026-08-01):
+# 4006 requests / 2292 s at 15 concurrent = ~8.6 s per request-slot = 105 req/min —
+# about 10% of the published limit, not 90%.
+#
+# EODHD_MAX_CONCURRENT_REQUESTS is a CEILING, not a fixed operating point: a burst of
+# concurrent requests can trip the vendor's real (undocumented) burst-level enforcement
+# even while the smoothed per-minute average has headroom (observed 2026-08-03 — a
+# sustained 429 rate at 40 concurrent while X-RateLimit-Remaining stayed near-full).
+# _AdaptiveConcurrencyGate below is an AIMD control loop over that ceiling: a 429 halves
+# the live limit immediately (EODHD's own signal beats any number picked ahead of time),
+# a run of clean responses grows it back by one at a time. This is per-consumer, same as
+# the static ceiling was: Hermes's equity ingest and Hephaestus's options ingest have very
+# different request latencies, so each measures and sets its own ceiling via the environment.
+# Resolved lazily on first request, NOT at import: the gate cannot be resized once built
+# with a stale ceiling, and consumers routinely call load_dotenv() after importing this
+# module (see Hephaestus's flows/main_flow.py). Reading at import time would silently pin
+# the value to the pre-.env environment and there would be no error to notice — the run
+# would just be slow. Every other knob here is re-read per call, so only this one needs
+# the dance.
+_DEFAULT_MAX_CONCURRENT_REQUESTS = 15
+_DEFAULT_ADAPTIVE_MIN_CONCURRENT_REQUESTS = 2
+_DEFAULT_ADAPTIVE_GROW_AFTER_CLEAN = 20
+
+
+class _AdaptiveConcurrencyGate:
+    """AIMD concurrency gate: halves the live limit on a 429, grows it back by one
+    after a streak of clean (HTTP 200) responses. Bounded to [floor, ceiling].
+
+    threading.Semaphore can't be resized once built, so this tracks in-flight count
+    and a mutable limit under a Condition instead of delegating to Semaphore.
+    """
+
+    def __init__(self, ceiling: int, floor: int) -> None:
+        self._ceiling = ceiling
+        self._floor = min(floor, ceiling)
+        self._limit = ceiling
+        self._in_flight = 0
+        self._clean_streak = 0
+        self._cond = threading.Condition()
+
+    def __enter__(self) -> "_AdaptiveConcurrencyGate":
+        with self._cond:
+            while self._in_flight >= self._limit:
+                self._cond.wait()
+            self._in_flight += 1
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        with self._cond:
+            self._in_flight -= 1
+            self._cond.notify_all()
+
+    def on_throttled(self) -> None:
+        with self._cond:
+            new_limit = max(self._floor, self._limit // 2)
+            if new_limit < self._limit:
+                _logger.warning(
+                    "[eodhd] adaptive concurrency: 429 observed — shrinking %d -> %d",
+                    self._limit, new_limit,
+                )
+            self._limit = new_limit
+            self._clean_streak = 0
+            self._cond.notify_all()
+
+    def on_clean_response(self) -> None:
+        grow_after = int(os.environ.get(
+            "EODHD_ADAPTIVE_GROW_AFTER_CLEAN", _DEFAULT_ADAPTIVE_GROW_AFTER_CLEAN,
+        ))
+        with self._cond:
+            if self._limit >= self._ceiling:
+                self._clean_streak = 0
+                return
+            self._clean_streak += 1
+            if self._clean_streak >= grow_after:
+                self._limit = min(self._ceiling, self._limit + 1)
+                self._clean_streak = 0
+                _logger.info(
+                    "[eodhd] adaptive concurrency: clean streak — growing to %d", self._limit,
+                )
+                self._cond.notify_all()
+
+
+_api_semaphore: Optional[_AdaptiveConcurrencyGate] = None
+_api_semaphore_lock = threading.Lock()
+
+
+def _get_api_semaphore() -> _AdaptiveConcurrencyGate:
+    global _api_semaphore
+    if _api_semaphore is None:
+        with _api_semaphore_lock:
+            if _api_semaphore is None:  # re-check: another thread may have won the race
+                ceiling = int(os.environ.get(
+                    "EODHD_MAX_CONCURRENT_REQUESTS", _DEFAULT_MAX_CONCURRENT_REQUESTS,
+                ))
+                if ceiling < 1:
+                    raise ValueError("EODHD_MAX_CONCURRENT_REQUESTS must be >= 1")
+                floor = int(os.environ.get(
+                    "EODHD_ADAPTIVE_MIN_CONCURRENT_REQUESTS",
+                    _DEFAULT_ADAPTIVE_MIN_CONCURRENT_REQUESTS,
+                ))
+                if floor < 1:
+                    raise ValueError("EODHD_ADAPTIVE_MIN_CONCURRENT_REQUESTS must be >= 1")
+                _logger.info(
+                    "[eodhd] request concurrency ceiling: %d (adaptive floor %d)", ceiling, floor,
+                )
+                _api_semaphore = _AdaptiveConcurrencyGate(ceiling, floor)
+    return _api_semaphore
 _logger = logging.getLogger(__name__)
 DEFAULT_OPTIONS_EOD_PAGE_LIMIT = 1000
 MARKETPLACE_API_CALLS_PER_REQUEST = 10
@@ -66,39 +195,91 @@ def _resolve_api_token(api_token: Optional[str]) -> str:
 
 def _get_with_retry(url: str) -> requests.Response:
     """
-    GET *url* with exponential back-off on HTTP 429 (and transient 5xx).
+    GET *url*, retrying on the conditions EODHD documents as retryable.
 
-    Respects the ``Retry-After`` response header when present.  Raises
-    ``EODHDLimitError`` after *_MAX_RETRIES* exhausted.
+    Status handling follows the vendor's own error table (see the eodhd-api skill,
+    ``references/general/rate-limits.md``) — these are three unrelated failures and
+    are raised as three distinct exception types so callers can act on them:
+
+    ==== ===================================== ==============================
+    Code Meaning                               Handling
+    ==== ===================================== ==============================
+    429  per-MINUTE request window full        few minute-scale retries
+    402  daily API *call* budget spent         no retry — defer the work
+    5xx  vendor-side fault (0 API calls spent) several second-scale retries
+    ==== ===================================== ==============================
+
+    ``Retry-After`` is honoured whenever present. Anything else is a hard error.
     """
-    delay = _BASE_DELAY
-    for attempt in range(_MAX_RETRIES + 1):
-        with _api_semaphore:
+    throttle_delay = _BASE_DELAY
+    server_delay = _SERVER_ERROR_BASE_DELAY
+    throttle_attempts = 0
+    server_attempts = 0
+
+    while True:
+        gate = _get_api_semaphore()
+        with gate:
             resp = requests.get(url, timeout=(10, 60))
         if resp.status_code == 200:
+            gate.on_clean_response()
             return resp
-        if resp.status_code == 429 or resp.status_code >= 500:
+
+        retry_after_hdr = resp.headers.get("Retry-After")
+        retry_after = float(retry_after_hdr) if retry_after_hdr else None
+
+        if resp.status_code == 402:
+            # Daily budget. Resets at midnight GMT (or the marketplace timeToReset),
+            # never inside a run — so there is nothing to wait for here.
+            raise EODHDQuotaExhaustedError(
+                f"EODHD HTTP 402 — daily API call budget exhausted: {resp.text[:200]}",
+                retry_after=retry_after,
+            )
+
+        if resp.status_code == 429:
+            # X-RateLimit-* describe THIS MINUTE's request window, not the daily
+            # call budget — label them as such so the message can't be misread.
+            # Report the burst regardless of remaining retries: a 429 at 1199/1200
+            # remaining is exactly the signal that our concurrency, not the minute
+            # window, is what's actually full (2026-08-03).
+            gate.on_throttled()
             remaining = resp.headers.get("X-RateLimit-Remaining", "?")
             limit = resp.headers.get("X-RateLimit-Limit", "?")
-            retry_after = resp.headers.get("Retry-After")
-            if attempt == _MAX_RETRIES:
-                raise EODHDLimitError(
-                    f"EODHD HTTP {resp.status_code} after {_MAX_RETRIES} retries "
-                    f"(quota {remaining}/{limit}): {resp.text[:200]}",
-                    retry_after=float(retry_after) if retry_after else None,
+            if throttle_attempts >= _MAX_RETRIES:
+                raise EODHDThrottleError(
+                    f"EODHD HTTP 429 after {throttle_attempts} retries — per-minute "
+                    f"request window full (requests left this minute: "
+                    f"{remaining}/{limit}): {resp.text[:200]}",
+                    retry_after=retry_after,
                 )
-            wait = float(retry_after) if retry_after else delay + random.uniform(0, delay * 0.3)
+            wait = retry_after or throttle_delay + random.uniform(0, throttle_delay * 0.3)
+            throttle_attempts += 1
             _logger.warning(
-                "[eodhd] HTTP %s (quota %s/%s) — retry %d/%d in %.0fs",
-                resp.status_code, remaining, limit, attempt + 1, _MAX_RETRIES, wait,
+                "[eodhd] HTTP 429 minute-window full (%s/%s left) — retry %d/%d in %.0fs",
+                remaining, limit, throttle_attempts, _MAX_RETRIES, wait,
             )
             time.sleep(wait)
-            delay = min(delay * 2, 900)  # grow up to 15 min
+            throttle_delay = min(throttle_delay * 2, 900)  # grow up to 15 min
             continue
+
+        if resp.status_code >= 500:
+            if server_attempts >= _SERVER_ERROR_MAX_RETRIES:
+                raise EODHDServerError(
+                    f"EODHD HTTP {resp.status_code} after {server_attempts} retries "
+                    f"— vendor-side fault, no API calls charged: {resp.text[:200]}",
+                    retry_after=retry_after,
+                )
+            wait = retry_after or server_delay + random.uniform(0, server_delay * 0.3)
+            server_attempts += 1
+            _logger.warning(
+                "[eodhd] HTTP %s (vendor-side) — retry %d/%d in %.1fs",
+                resp.status_code, server_attempts, _SERVER_ERROR_MAX_RETRIES, wait,
+            )
+            time.sleep(wait)
+            server_delay = min(server_delay * 2, 60.0)
+            continue
+
         # Non-retryable error
         raise RuntimeError(f"EODHD HTTP {resp.status_code}: {resp.text[:200]}")
-    # unreachable
-    raise RuntimeError("Retry loop exhausted")
 
 
 def fetch_eodhd_user_details(api_token: Optional[str] = None) -> Dict[str, Any]:
@@ -464,10 +645,13 @@ def _is_limit_message(message: str) -> bool:
 
 def _decode_eodhd_payload(resp: requests.Response, request_label: str) -> Any:
     if resp.status_code == 429:
-        raise EODHDLimitError(f"EODHD throttled request for {request_label}: HTTP 429")
+        raise EODHDThrottleError(f"EODHD throttled request for {request_label}: HTTP 429")
     response_text = (resp.text or "").strip()
     if resp.status_code in {402, 403} and _is_limit_message(response_text):
-        raise EODHDLimitError(
+        # 402 is the documented daily-call-budget wall; 403 is an entitlement/auth
+        # refusal that merely carries a limit-shaped message — not the same thing.
+        err = EODHDQuotaExhaustedError if resp.status_code == 402 else EODHDLimitError
+        raise err(
             f"EODHD rejected request for {request_label}: {_payload_summary(response_text)}"
         )
     try:
@@ -514,7 +698,7 @@ def fetch_eod(
         _logger.warning("%s: 404 not found", symbol_full)
         return pd.DataFrame()
     if resp.status_code == 429:
-        raise EODHDLimitError(f"EODHD throttled request for {symbol_full}: HTTP 429")
+        raise EODHDThrottleError(f"EODHD throttled request for {symbol_full}: HTTP 429")
 
     try:
         resp.raise_for_status()
@@ -560,7 +744,7 @@ def fetch_bulk_eod_for_exchange(
             _logger.debug("fetch_bulk_eod_for_exchange: 404 for %s on %s", exchange_code, date_str)
             return pd.DataFrame()
         if resp.status_code == 429:
-            raise EODHDLimitError(
+            raise EODHDThrottleError(
                 f"EODHD throttled bulk request for {exchange_code} on {date_str}: HTTP 429"
             )
         resp.raise_for_status()
@@ -594,15 +778,77 @@ def fetch_bulk_eod_for_exchange(
         return pd.DataFrame()
 
 
+def fetch_exchange_catalog(api_key: str = "") -> list[dict[str, Any]]:
+    """Fetch the EODHD ``exchanges-list`` catalog (all exchanges + country/currency).
+
+    Returns the raw list of exchange records, or an empty list on error / missing
+    key. Raises :class:`EODHDLimitError` on throttling. Per-process caching and any
+    domain shaping are the caller's responsibility.
+    """
+    key = api_key or os.environ.get("EODHD_API_KEY", "")
+    if not key:
+        _logger.error("EODHD_API_KEY is not set — cannot fetch exchange list")
+        return []
+    try:
+        resp = requests.get(
+            f"{_EODHD_BASE}/exchanges-list/",
+            params={"api_token": key, "fmt": "json"},
+            timeout=30,
+        )
+        if resp.status_code == 429:
+            raise EODHDThrottleError("EODHD throttled exchanges-list request: HTTP 429")
+        resp.raise_for_status()
+        payload = _decode_eodhd_payload(resp, "exchanges-list")
+        return payload if isinstance(payload, list) else []
+    except EODHDLimitError:
+        raise
+    except Exception as exc:
+        _logger.error("Failed to fetch EODHD exchange list: %s", exc)
+        return []
+
+
+def fetch_exchange_symbol_list(exchange_code: str, api_key: str = "") -> list[dict[str, Any]]:
+    """Fetch one exchange's raw ``exchange-symbol-list`` records from EODHD.
+
+    Returns the raw list of records (each carrying ``Code``/``Exchange``/``Type``/...),
+    or an empty list on 404 / error / missing key. Raises :class:`EODHDLimitError`
+    on throttling. Keying and record shaping are the caller's responsibility.
+    """
+    key = api_key or os.environ.get("EODHD_API_KEY", "")
+    if not key:
+        return []
+    try:
+        resp = requests.get(
+            f"{_EODHD_BASE}/exchange-symbol-list/{exchange_code}",
+            params={"api_token": key, "fmt": "json"},
+            timeout=60,
+        )
+        if resp.status_code == 404:
+            _logger.debug("exchange-symbol-list: 404 for exchange %s", exchange_code)
+            return []
+        if resp.status_code == 429:
+            raise EODHDLimitError(
+                f"EODHD throttled exchange-symbol-list request for {exchange_code}: HTTP 429"
+            )
+        resp.raise_for_status()
+        payload = _decode_eodhd_payload(resp, f"exchange-symbol-list {exchange_code}")
+        return payload if isinstance(payload, list) else []
+    except EODHDLimitError:
+        raise
+    except Exception as exc:
+        _logger.warning("Failed to fetch symbol list for exchange %s: %s", exchange_code, exc)
+        return []
+
+
 # Per-interval maximum window EODHD accepts in a single intraday request (days).
 # Longer ranges are silently truncated by the API, so callers must chunk.
-_INTRADAY_MAX_WINDOW_DAYS: dict[str, int] = {"1m": 120, "5m": 600, "1h": 7200}
+INTRADAY_MAX_WINDOW_DAYS: dict[str, int] = {"1m": 120, "5m": 600, "1h": 7200}
 
 # Earliest date EODHD has intraday history for, per interval (US equities). 1-min
 # goes back to 2004; 5-min and 1-hour only to October 2020. Requests before the
 # floor return empty (still billed 5 calls), so backfills should clamp the start.
 # None = no documented floor (1m is the deepest, though it varies by ticker).
-_INTRADAY_HISTORY_START: dict[str, "date | None"] = {
+INTRADAY_HISTORY_START: dict[str, "date | None"] = {
     "1m": None, "5m": date(2020, 10, 1), "1h": date(2020, 10, 1),
 }
 
@@ -621,7 +867,7 @@ def fetch_intraday(
     """Fetch intraday OHLCV bars for one symbol over a Unix-timestamp (UTC) window.
 
     ``interval`` is one of ``1m``/``5m``/``1h``. EODHD caps a single request at
-    120/600/7200 days respectively (see ``_INTRADAY_MAX_WINDOW_DAYS``); ranges longer
+    120/600/7200 days respectively (see ``INTRADAY_MAX_WINDOW_DAYS``); ranges longer
     than the cap are silently truncated by the API, so callers must chunk.
 
     Returns bars in **UTC** with columns
@@ -638,15 +884,15 @@ def fetch_intraday(
         _logger.error("EODHD_API_KEY is not set — cannot fetch intraday %s.%s", ticker, exchange)
         return pd.DataFrame()
 
-    if interval not in _INTRADAY_MAX_WINDOW_DAYS:
+    if interval not in INTRADAY_MAX_WINDOW_DAYS:
         raise ValueError(f"fetch_intraday: unsupported interval {interval!r} (expected 1m/5m/1h)")
 
     symbol_full = f"{ticker}.{exchange}"
     span_days = (int(to_ts) - int(from_ts)) / 86400.0
-    if span_days > _INTRADAY_MAX_WINDOW_DAYS[interval]:
+    if span_days > INTRADAY_MAX_WINDOW_DAYS[interval]:
         _logger.warning(
             "fetch_intraday %s %s: requested %.0fd exceeds %dd cap — API will truncate; chunk the range",
-            symbol_full, interval, span_days, _INTRADAY_MAX_WINDOW_DAYS[interval],
+            symbol_full, interval, span_days, INTRADAY_MAX_WINDOW_DAYS[interval],
         )
 
     try:
@@ -669,7 +915,7 @@ def fetch_intraday(
         _logger.warning("intraday %s: 404 not found", symbol_full)
         return pd.DataFrame()
     if resp.status_code == 429:
-        raise EODHDLimitError(f"EODHD throttled intraday request for {symbol_full}: HTTP 429")
+        raise EODHDThrottleError(f"EODHD throttled intraday request for {symbol_full}: HTTP 429")
 
     try:
         resp.raise_for_status()

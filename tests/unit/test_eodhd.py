@@ -5,6 +5,9 @@ Hephaestus implementation (parity, FR-005/SC-005).
 """
 from __future__ import annotations
 
+import threading
+import time
+
 import pandas as pd
 import pytest
 
@@ -20,7 +23,12 @@ from ingest_core.clients.eodhd import (
     fetch_eod,
 )
 from ingest_core.ratelimit import RateLimiter
-from ingest_core.types import EODHDLimitError
+from ingest_core.types import (
+    EODHDLimitError,
+    EODHDQuotaExhaustedError,
+    EODHDServerError,
+    EODHDThrottleError,
+)
 
 
 class _FakeResponse:
@@ -168,3 +176,189 @@ def test_client_facade_paces_fetch_page(monkeypatch):
     assert client.decode(page) == []
     with pytest.raises(ValueError):
         client.build_url("nope")
+
+
+# ---------------------------------------------------------------------------
+# _get_with_retry status classification (2026-07-27)
+#
+# 429 / 402 / 5xx are three unrelated failures. They previously shared one
+# branch and one exception type, with the rate-limit headers stamped into every
+# message — so a vendor 5xx was indistinguishable from a quota wall downstream.
+# ---------------------------------------------------------------------------
+
+
+def _patch_get(monkeypatch, responses):
+    """Serve *responses* in order; record how many GETs were made."""
+    calls = {"n": 0}
+
+    def _fake_get(url, timeout=None):
+        i = min(calls["n"], len(responses) - 1)
+        calls["n"] += 1
+        return responses[i]
+
+    monkeypatch.setattr(eodhd.requests, "get", _fake_get)
+    monkeypatch.setattr(eodhd.time, "sleep", lambda _s: None)
+    return calls
+
+
+def test_500_raises_server_error_not_a_limit_error(monkeypatch):
+    """EODHD documents 5xx as 'retry after a short delay', billed 0 API calls —
+    it is not a limit condition and must not claim to be one."""
+    resp = _FakeResponse(
+        status_code=500,
+        text="Error occurred. Please contact support@eodhistoricaldata.com",
+        headers={"X-RateLimit-Remaining": "1197", "X-RateLimit-Limit": "1200"},
+    )
+    calls = _patch_get(monkeypatch, [resp])
+
+    with pytest.raises(EODHDServerError) as exc_info:
+        eodhd._get_with_retry("https://eodhd.com/api/whatever")
+
+    # Retried several times on a short schedule, not once after a minute.
+    assert calls["n"] == eodhd._SERVER_ERROR_MAX_RETRIES + 1
+    # The old message interpolated "quota {remaining}/{limit}" here, which is the
+    # per-minute window and had nothing to do with the failure.
+    assert "quota" not in str(exc_info.value).lower()
+
+
+def test_429_raises_throttle_error_and_labels_the_minute_window(monkeypatch):
+    resp = _FakeResponse(
+        status_code=429,
+        text="Too many requests",
+        headers={"X-RateLimit-Remaining": "0", "X-RateLimit-Limit": "1000"},
+    )
+    _patch_get(monkeypatch, [resp])
+
+    with pytest.raises(EODHDThrottleError) as exc_info:
+        eodhd._get_with_retry("https://eodhd.com/api/whatever")
+
+    assert "per-minute" in str(exc_info.value)
+
+
+def test_402_raises_quota_exhausted_and_does_not_retry(monkeypatch):
+    """402 is the daily call budget; it resets at midnight GMT, never mid-run,
+    so retrying is pure waste."""
+    resp = _FakeResponse(status_code=402, text="Payment Required")
+    calls = _patch_get(monkeypatch, [resp])
+
+    with pytest.raises(EODHDQuotaExhaustedError):
+        eodhd._get_with_retry("https://eodhd.com/api/whatever")
+
+    assert calls["n"] == 1
+
+
+def test_transient_500_then_success_returns_the_payload(monkeypatch):
+    ok = _FakeResponse(status_code=200, payload={"ok": True})
+    bad = _FakeResponse(status_code=503, text="upstream unavailable")
+    _patch_get(monkeypatch, [bad, ok])
+
+    assert eodhd._get_with_retry("https://eodhd.com/api/whatever") is ok
+
+
+def test_all_typed_errors_remain_catchable_as_eodhd_limit_error():
+    """Hermes's backfill and ingest_core.retry both catch EODHDLimitError to mean
+    'the provider said no' — the new subclasses must not slip past them."""
+    for cls in (EODHDThrottleError, EODHDQuotaExhaustedError, EODHDServerError):
+        assert issubclass(cls, EODHDLimitError)
+        assert issubclass(cls, RuntimeError)
+
+
+# ---------------------------------------------------------------------------
+# Adaptive concurrency gate (2026-08-03)
+#
+# A sustained 429 rate was observed at 40 concurrent requests while
+# X-RateLimit-Remaining stayed near-full — the vendor's real burst-level
+# enforcement, not the documented per-minute average, was the actual wall.
+# EODHD_MAX_CONCURRENT_REQUESTS is now a ceiling the gate operates under, not
+# a fixed point: it halves on a 429, grows back by one after a clean streak.
+# ---------------------------------------------------------------------------
+
+
+def test_adaptive_gate_halves_on_throttle_and_holds_the_floor():
+    gate = eodhd._AdaptiveConcurrencyGate(ceiling=8, floor=2)
+
+    gate.on_throttled()
+    assert gate._limit == 4
+    gate.on_throttled()
+    assert gate._limit == 2  # floor
+    gate.on_throttled()
+    assert gate._limit == 2  # does not go below the floor
+
+
+def test_adaptive_gate_grows_by_one_after_a_clean_streak(monkeypatch):
+    monkeypatch.setenv("EODHD_ADAPTIVE_GROW_AFTER_CLEAN", "2")
+    gate = eodhd._AdaptiveConcurrencyGate(ceiling=8, floor=2)
+    gate._limit = 2
+
+    gate.on_clean_response()
+    assert gate._limit == 2  # streak 1 of 2 — not yet
+    gate.on_clean_response()
+    assert gate._limit == 3  # streak hit 2 — grows by exactly one
+
+    gate._limit = 8
+    gate.on_clean_response()
+    assert gate._limit == 8  # never exceeds the ceiling
+
+
+def test_adaptive_gate_blocks_admission_above_the_live_limit():
+    gate = eodhd._AdaptiveConcurrencyGate(ceiling=8, floor=1)
+    gate._limit = 1
+
+    release_first = threading.Event()
+    entered_second = threading.Event()
+
+    def hold_first():
+        with gate:
+            release_first.wait(timeout=2)
+
+    def try_second():
+        with gate:
+            entered_second.set()
+
+    t1 = threading.Thread(target=hold_first)
+    t1.start()
+    time.sleep(0.05)  # let t1 acquire before t2 tries
+    t2 = threading.Thread(target=try_second)
+    t2.start()
+    time.sleep(0.1)
+    assert not entered_second.is_set(), "second entrant admitted past a limit of 1"
+
+    release_first.set()
+    t1.join(timeout=2)
+    t2.join(timeout=2)
+    assert entered_second.is_set(), "second entrant never admitted after the first released"
+
+
+class _SpyGate:
+    def __init__(self) -> None:
+        self.throttled = 0
+        self.clean = 0
+
+    def __enter__(self) -> "_SpyGate":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+    def on_throttled(self) -> None:
+        self.throttled += 1
+
+    def on_clean_response(self) -> None:
+        self.clean += 1
+
+
+def test_get_with_retry_reports_throttle_then_clean_response_to_the_gate(monkeypatch):
+    spy = _SpyGate()
+    monkeypatch.setattr(eodhd, "_get_api_semaphore", lambda: spy)
+    resp_429 = _FakeResponse(
+        status_code=429, text="slow down",
+        headers={"X-RateLimit-Remaining": "1199", "X-RateLimit-Limit": "1200"},
+    )
+    resp_200 = _FakeResponse(status_code=200, payload={"ok": True})
+    _patch_get(monkeypatch, [resp_429, resp_200])
+
+    result = eodhd._get_with_retry("https://eodhd.com/api/whatever")
+
+    assert result is resp_200
+    assert spy.throttled == 1
+    assert spy.clean == 1
