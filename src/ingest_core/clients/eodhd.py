@@ -71,9 +71,12 @@ _PAGE_DELAY = 1.0   # seconds to sleep between paginated requests
 # concurrent requests can trip the vendor's real (undocumented) burst-level enforcement
 # even while the smoothed per-minute average has headroom (observed 2026-08-03 — a
 # sustained 429 rate at 40 concurrent while X-RateLimit-Remaining stayed near-full).
-# _AdaptiveConcurrencyGate below is an AIMD control loop over that ceiling: a 429 halves
-# the live limit immediately (EODHD's own signal beats any number picked ahead of time),
-# a run of clean responses grows it back by one at a time. This is per-consumer, same as
+# _AdaptiveConcurrencyGate below is an AIMD control loop over that ceiling: a congestion
+# signal halves the live limit immediately (EODHD's own signal beats any number picked
+# ahead of time), a run of clean responses grows it back by one at a time. Congestion
+# means 429 *or* 5xx — on /options/contracts the vendor times a pushed request out into a
+# 500 instead of shedding it with a 429 (2026-08-05), so listening only for 429 left the
+# gate deaf to the wave that mattered. This is per-consumer, same as
 # the static ceiling was: Hermes's equity ingest and Hephaestus's options ingest have very
 # different request latencies, so each measures and sets its own ceiling via the environment.
 # Resolved lazily on first request, NOT at import: the gate cannot be resized once built
@@ -88,8 +91,17 @@ _DEFAULT_ADAPTIVE_GROW_AFTER_CLEAN = 20
 
 
 class _AdaptiveConcurrencyGate:
-    """AIMD concurrency gate: halves the live limit on a 429, grows it back by one
-    after a streak of clean (HTTP 200) responses. Bounded to [floor, ceiling].
+    """AIMD concurrency gate: halves the live limit on a congestion signal, grows it
+    back by one after a streak of clean (HTTP 200) responses. Bounded to [floor, ceiling].
+
+    **Both 429 and 5xx count as congestion.** 429 is the obvious one, but this vendor
+    does not use it for the failure that actually matters: /options/contracts answers a
+    large chain slowly (SPY 25-56s at rest vs GOOG ~2s) and, when pushed, times out
+    server-side into a 500 rather than rejecting with a 429. Measured 2026-08-05 — at 40
+    concurrent, 69% of 473 symbols failed with 500s while zero 429s were seen and
+    X-RateLimit-Remaining stayed ~96% free; the same universe at concurrency 8 failed
+    under 1%. Treating only 429 as congestion left the gate pinned at its ceiling for the
+    entire outage, applying no backpressure on the one endpoint that needed it.
 
     threading.Semaphore can't be resized once built, so this tracks in-flight count
     and a mutable limit under a Condition instead of delegating to Semaphore.
@@ -115,13 +127,14 @@ class _AdaptiveConcurrencyGate:
             self._in_flight -= 1
             self._cond.notify_all()
 
-    def on_throttled(self) -> None:
+    def on_congestion(self, signal: str = "429") -> None:
+        """Multiplicative decrease. ``signal`` labels the trigger for the log only."""
         with self._cond:
             new_limit = max(self._floor, self._limit // 2)
             if new_limit < self._limit:
                 _logger.warning(
-                    "[eodhd] adaptive concurrency: 429 observed — shrinking %d -> %d",
-                    self._limit, new_limit,
+                    "[eodhd] adaptive concurrency: %s observed — shrinking %d -> %d",
+                    signal, self._limit, new_limit,
                 )
             self._limit = new_limit
             self._clean_streak = 0
@@ -210,6 +223,12 @@ def _get_with_retry(url: str) -> requests.Response:
     ==== ===================================== ==============================
 
     ``Retry-After`` is honoured whenever present. Anything else is a hard error.
+
+    Note for budget accounting: 429s and 5xx are **billed 0 API calls**, so a
+    caller metering the provider's daily quota must NOT charge for retried
+    attempts — only a 200 actually costs quota. Cost control therefore belongs
+    at the *decision* point (know a symbol's page count before committing to it,
+    see ``Budget.try_reserve``), not in this retry loop.
     """
     throttle_delay = _BASE_DELAY
     server_delay = _SERVER_ERROR_BASE_DELAY
@@ -241,7 +260,7 @@ def _get_with_retry(url: str) -> requests.Response:
             # Report the burst regardless of remaining retries: a 429 at 1199/1200
             # remaining is exactly the signal that our concurrency, not the minute
             # window, is what's actually full (2026-08-03).
-            gate.on_throttled()
+            gate.on_congestion("429")
             remaining = resp.headers.get("X-RateLimit-Remaining", "?")
             limit = resp.headers.get("X-RateLimit-Limit", "?")
             if throttle_attempts >= _MAX_RETRIES:
@@ -262,6 +281,12 @@ def _get_with_retry(url: str) -> requests.Response:
             continue
 
         if resp.status_code >= 500:
+            # Congestion signal, not just a fault. This vendor times a slow request out
+            # into a 500 instead of shedding it with a 429, so on the endpoint most prone
+            # to overload (/options/contracts) 5xx is the ONLY backpressure signal we get.
+            # Fires per attempt, like the 429 path: a sustained wave should collapse the
+            # limit toward the floor fast, and the clean-streak rule grows it back.
+            gate.on_congestion(f"HTTP {resp.status_code}")
             if server_attempts >= _SERVER_ERROR_MAX_RETRIES:
                 raise EODHDServerError(
                     f"EODHD HTTP {resp.status_code} after {server_attempts} retries "
@@ -406,11 +431,20 @@ def build_options_contracts_url(
     page_offset: int = 0,
     page_limit: int = DEFAULT_OPTIONS_EOD_PAGE_LIMIT,
     fields: Optional[list[str]] = None,
+    option_type: Optional[str] = None,
 ) -> str:
     """Build an options/contracts URL for the full *current* chain of an underlying.
 
     Returns one row per live contract (current EOD snapshot, incl. untraded) — used to
     capture today's chain and to enumerate the live expiry set. No tradetime filter.
+
+    ``option_type`` ("call"/"put") halves the chain. Verified honoured 2026-08-05 (a
+    filtered pull returned calls only), and it is the lever for the chains that sit on
+    the vendor's ~56s server-side timeout: SPY answers in 25-56s and intermittently
+    500s even at one request per 45 seconds, so fetching it as two smaller requests is
+    what gets each under the limit. Note ``meta`` carries NO ``total`` on this endpoint,
+    so a chain's size cannot be priced up front — narrowing the request is the only
+    control available.
     """
     params: list[tuple[str, str | int]] = [
         ("filter[underlying_symbol]", _normalize_underlying(underlying_symbol)),
@@ -419,6 +453,8 @@ def build_options_contracts_url(
         ("compact", 0),
         ("sort", "-exp_date"),
     ]
+    if option_type:
+        params.append(("filter[type]", option_type))
     if fields:
         params.append(("fields[options-contracts]", ",".join(fields)))
     return f"https://eodhd.com/api/mp/unicornbay/options/contracts?{urlencode(params)}"
@@ -513,7 +549,12 @@ def fetch_eodhd_page(
     url: str,
     api_token: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Fetch a single Unicorn Bay page and normalize its rows."""
+    """Fetch a single Unicorn Bay page and normalize its rows.
+
+    The returned ``meta`` carries the vendor's ``total`` record count — that is
+    what lets a caller price the rest of a chain from page 1 alone, instead of
+    discovering the cost by paging blindly (see ``Budget.try_reserve``).
+    """
     api_token = _resolve_api_token(api_token)
 
     separator = "&" if "?" in url else "?"

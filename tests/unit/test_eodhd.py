@@ -274,14 +274,14 @@ def test_all_typed_errors_remain_catchable_as_eodhd_limit_error():
 # ---------------------------------------------------------------------------
 
 
-def test_adaptive_gate_halves_on_throttle_and_holds_the_floor():
+def test_adaptive_gate_halves_on_congestion_and_holds_the_floor():
     gate = eodhd._AdaptiveConcurrencyGate(ceiling=8, floor=2)
 
-    gate.on_throttled()
+    gate.on_congestion()
     assert gate._limit == 4
-    gate.on_throttled()
+    gate.on_congestion()
     assert gate._limit == 2  # floor
-    gate.on_throttled()
+    gate.on_congestion()
     assert gate._limit == 2  # does not go below the floor
 
 
@@ -333,6 +333,7 @@ class _SpyGate:
     def __init__(self) -> None:
         self.throttled = 0
         self.clean = 0
+        self.signals: list[str] = []
 
     def __enter__(self) -> "_SpyGate":
         return self
@@ -340,8 +341,9 @@ class _SpyGate:
     def __exit__(self, *exc_info: object) -> None:
         return None
 
-    def on_throttled(self) -> None:
+    def on_congestion(self, signal: str = "429") -> None:
         self.throttled += 1
+        self.signals.append(signal)
 
     def on_clean_response(self) -> None:
         self.clean += 1
@@ -362,3 +364,38 @@ def test_get_with_retry_reports_throttle_then_clean_response_to_the_gate(monkeyp
     assert result is resp_200
     assert spy.throttled == 1
     assert spy.clean == 1
+    assert spy.signals == ["429"]
+
+
+def test_get_with_retry_reports_5xx_to_the_gate_as_congestion(monkeypatch):
+    """A 500 must apply backpressure, not just retry.
+
+    Regression for 2026-08-05: /options/contracts times a large chain out into a
+    500 rather than shedding it with a 429, so 5xx is the only congestion signal
+    available on that endpoint. Because the gate only listened for 429, it stayed
+    pinned at its ceiling of 40 through a 69% failure rate and never backed off.
+    """
+    monkeypatch.setenv("EODHD_5XX_BASE_DELAY", "0")
+    spy = _SpyGate()
+    monkeypatch.setattr(eodhd, "_get_api_semaphore", lambda: spy)
+    resp_500 = _FakeResponse(status_code=500, text="Error occurred.")
+    resp_200 = _FakeResponse(status_code=200, payload={"ok": True})
+    _patch_get(monkeypatch, [resp_500, resp_500, resp_200])
+
+    result = eodhd._get_with_retry("https://eodhd.com/api/whatever")
+
+    assert result is resp_200
+    assert spy.throttled == 2, "each 5xx attempt should shrink the gate"
+    assert spy.signals == ["HTTP 500", "HTTP 500"]
+    assert spy.clean == 1
+
+
+def test_sustained_5xx_collapses_the_live_limit_toward_the_floor():
+    """The behaviour that would have contained the 2026-08-05 incident."""
+    gate = eodhd._AdaptiveConcurrencyGate(ceiling=40, floor=2)
+    assert gate._limit == 40
+
+    for _ in range(5):
+        gate.on_congestion("HTTP 500")
+
+    assert gate._limit == 2, "a sustained 500 wave must drive concurrency to the floor"

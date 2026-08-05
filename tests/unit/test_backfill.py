@@ -15,6 +15,7 @@ from ingest_core.backfill import (
     Budget,
     PrehistoryResult,
     iter_range_records,
+    pages_for_total,
     probe_quota_reset,
     quota_remaining_requests,
     run_prehistory_walk,
@@ -53,7 +54,58 @@ def test_budget_thread_safe():
     threads = [threading.Thread(target=spin) for _ in range(8)]
     [t.start() for t in threads]
     [t.join() for t in threads]
-    assert b.requests == 8000
+
+
+def test_budget_try_reserve_is_all_or_nothing():
+    b = Budget(5)
+    assert b.try_reserve(3) and b.remaining() == 2
+    assert not b.try_reserve(3)  # doesn't fit
+    assert b.remaining() == 2    # ...and claimed nothing
+    assert b.try_reserve(2) and b.exceeded()
+
+
+def test_budget_refund_returns_unspent_claim():
+    b = Budget(10)
+    b.try_reserve(8)
+    b.refund(5)  # chain ended earlier than meta.total implied
+    assert b.remaining() == 7
+
+
+def test_budget_reserve_is_atomic_under_concurrency():
+    """The 2026-08-04 overrun: N workers each independently concluding the same
+    last slots were free. Exactly `max` reservations must succeed, never more."""
+    b = Budget(50)
+    wins = []
+
+    def grab():
+        for _ in range(20):
+            if b.try_reserve(1):
+                wins.append(1)
+
+    threads = [threading.Thread(target=grab) for _ in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert len(wins) == 50 and b.requests == 50
+
+
+def test_budget_unmetered_reserve_always_succeeds():
+    b = Budget(None)
+    assert b.try_reserve(10_000_000)
+    assert not b.exceeded()
+
+
+@pytest.mark.parametrize(
+    "meta,expected",
+    [
+        ({"total": 0}, 1),                      # empty chain still costs its one page
+        ({"total": 1000, "limit": 1000}, 1),
+        ({"total": 1001, "limit": 1000}, 2),
+        ({}, None),                             # vendor didn't say — caller pays per page
+        ({"total": 999_999, "limit": 1000}, 11),  # clamped to the offset cap's reach
+    ],
+)
+def test_pages_for_total(meta, expected):
+    assert pages_for_total(meta, page_limit=1000, offset_cap=10_000) == expected
 
 
 # ---------------------------------------------------------------------------
