@@ -80,6 +80,22 @@ def test_build_options_eod_url_ascending_sort_opt_in():
     assert "sort=-exp_date" not in url
 
 
+def test_build_options_eod_url_exp_date_range_opt_in():
+    """Server-side expiry narrowing. Sort direction only reorders a capped page, so for a
+    dense chain even ascending can miss a short DTE window entirely; this constrains what
+    the vendor returns. Both params are independent and omitted by default."""
+    url = build_options_eod_url(
+        "SPY", "2023-10-09", "2023-10-09",
+        exp_date_from="2023-10-14", exp_date_to="2024-04-26",
+    )
+    assert "filter%5Bexp_date_from%5D=2023-10-14" in url
+    assert "filter%5Bexp_date_to%5D=2024-04-26" in url
+
+    bare = build_options_eod_url("SPY", "2023-10-09", "2023-10-09")
+    assert "exp_date_from" not in bare
+    assert "exp_date_to" not in bare
+
+
 def test_build_options_contracts_urls_characterization():
     assert build_options_contracts_url("SPY", page_limit=500) == (
         "https://eodhd.com/api/mp/unicornbay/options/contracts?filter%5Bunderlying_symbol%5D=SPY"

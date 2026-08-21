@@ -382,6 +382,8 @@ def build_options_eod_url(
     fields: Optional[list[str]] = None,
     option_type: Optional[str] = None,
     sort: str = "-exp_date",
+    exp_date_from: Optional[str] = None,
+    exp_date_to: Optional[str] = None,
 ) -> str:
     """
     Build a Unicorn Bay options/eod URL using documented tradetime filters.
@@ -399,6 +401,15 @@ def build_options_eod_url(
     filters on a short DTE window with nothing at all — measured on SPY, where a
     descending page yields **zero** contracts inside a 5-200 DTE band on every date
     tested, while an ascending page yields 114-268.
+
+    *exp_date_from* / *exp_date_to* (``YYYY-MM-DD``) apply ``filter[exp_date_from]`` /
+    ``filter[exp_date_to]``, narrowing the response to an expiry window **server-side**.
+    This is the robust form of the same concern: sort direction only reorders a capped
+    page, so for a dense enough chain even the ascending page misses the window entirely.
+    Measured on SPY at 2023-10-09, where the underlying has enough near-dated contracts to
+    fill all 1000 rows with 0-3 DTE: unfiltered the page holds **zero** contracts in a
+    5-200 DTE band, while requesting that expiry range returns **1000** of them, in one
+    request and with no pagination.
     """
     base_symbol = underlying_symbol.replace(".US", "").upper()
     # EODHD expects BRK.B effectively as BRK-B (or just BRK-B) in some endpoints.
@@ -415,6 +426,11 @@ def build_options_eod_url(
 
     if option_type:
         params.append(("filter[type]", option_type))
+
+    if exp_date_from:
+        params.append(("filter[exp_date_from]", exp_date_from))
+    if exp_date_to:
+        params.append(("filter[exp_date_to]", exp_date_to))
 
     if start_date and end_date and start_date == end_date:
         params.append(("filter[tradetime_eq]", start_date))
