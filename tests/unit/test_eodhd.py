@@ -69,6 +69,17 @@ def test_build_options_eod_url_range_characterization():
     )
 
 
+def test_build_options_eod_url_ascending_sort_opt_in():
+    """`sort` is opt-in; the two characterization tests above pin the unchanged default.
+
+    A caller filtering on a short DTE window needs the near-dated end of the chain — a
+    descending page is capped at page[limit] and can be entirely LEAPS.
+    """
+    url = build_options_eod_url("SPY", "2026-03-13", "2026-03-13", sort="exp_date")
+    assert "sort=exp_date" in url
+    assert "sort=-exp_date" not in url
+
+
 def test_build_options_contracts_urls_characterization():
     assert build_options_contracts_url("SPY", page_limit=500) == (
         "https://eodhd.com/api/mp/unicornbay/options/contracts?filter%5Bunderlying_symbol%5D=SPY"

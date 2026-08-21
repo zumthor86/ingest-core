@@ -381,6 +381,7 @@ def build_options_eod_url(
     compact: bool = False,
     fields: Optional[list[str]] = None,
     option_type: Optional[str] = None,
+    sort: str = "-exp_date",
 ) -> str:
     """
     Build a Unicorn Bay options/eod URL using documented tradetime filters.
@@ -390,6 +391,14 @@ def build_options_eod_url(
     ``filter[tradetime_from]`` / ``filter[tradetime_to]``.
 
     *option_type* may be ``'call'`` or ``'put'`` to apply ``filter[type]``.
+
+    *sort* defaults to ``-exp_date`` (longest expiry first), which the bulk ingest
+    relies on. Pass ``exp_date`` when the caller needs the **near-dated** end of the
+    chain instead: the response is capped at ``page[limit]`` (1000), so descending
+    expiry can return a page consisting entirely of LEAPS and leave a caller that
+    filters on a short DTE window with nothing at all — measured on SPY, where a
+    descending page yields **zero** contracts inside a 5-200 DTE band on every date
+    tested, while an ascending page yields 114-268.
     """
     base_symbol = underlying_symbol.replace(".US", "").upper()
     # EODHD expects BRK.B effectively as BRK-B (or just BRK-B) in some endpoints.
@@ -401,7 +410,7 @@ def build_options_eod_url(
         ("page[offset]", page_offset),
         ("page[limit]", min(page_limit, DEFAULT_OPTIONS_EOD_PAGE_LIMIT)),
         ("compact", 1 if compact else 0),
-        ("sort", "-exp_date"),
+        ("sort", sort),
     ]
 
     if option_type:
