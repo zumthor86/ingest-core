@@ -457,11 +457,29 @@ def build_options_contracts_url(
     page_limit: int = DEFAULT_OPTIONS_EOD_PAGE_LIMIT,
     fields: Optional[list[str]] = None,
     option_type: Optional[str] = None,
+    exp_date_from: Optional[str] = None,
 ) -> str:
-    """Build an options/contracts URL for the full *current* chain of an underlying.
+    """Build an options/contracts URL for the current chain of an underlying.
 
-    Returns one row per live contract (current EOD snapshot, incl. untraded) — used to
-    capture today's chain and to enumerate the live expiry set. No tradetime filter.
+    **This endpoint is NOT "the live chain", despite the name.** Measured 2026-08-23: an
+    unfiltered AA pull returns 10,988 contracts across 11 pages and stops at the offset
+    cap, and page 11 is still returning contracts that expired in **2024**. Roughly 93% of
+    an unfiltered response is contracts that are dead and cannot change again. Each row
+    carries that contract's *last* state, so this is a roster plus last-known quote — not
+    a point-in-time snapshot of any chosen day.
+
+    ``exp_date_from`` (``YYYY-MM-DD``) drops contracts expiring before that date,
+    server-side. Pass a bound a little **earlier than today**: a contract that expired last
+    week still needs its final quotes captured. Measured effect, same day:
+
+    - AA at ``exp_date_from`` = today-10: **936 rows, one page** (from 11 pages).
+    - SPY: **no effect at all** — 11,000 rows over 11 pages either way, because SPY's live
+      chain alone exceeds the 10,000 offset cap. For chains that large the only remaining
+      lever is ``option_type``, or splitting by expiry window.
+
+    So this narrows mid-size chains sharply and does nothing for the largest ones. Note
+    ``filter[exp_date_gte]`` is **silently ignored** by the vendor — it returns the
+    unfiltered page, which looks like success.
 
     ``option_type`` ("call"/"put") halves the chain. Verified honoured 2026-08-05 (a
     filtered pull returned calls only), and it is the lever for the chains that sit on
@@ -480,6 +498,8 @@ def build_options_contracts_url(
     ]
     if option_type:
         params.append(("filter[type]", option_type))
+    if exp_date_from:
+        params.append(("filter[exp_date_from]", exp_date_from))
     if fields:
         params.append(("fields[options-contracts]", ",".join(fields)))
     return f"https://eodhd.com/api/mp/unicornbay/options/contracts?{urlencode(params)}"
