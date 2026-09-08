@@ -12,3 +12,6 @@ build/
 Thumbs.db
 .vscode/
 .idea/
+
+# Claude Code worktrees — local scratch checkouts, never part of the library
+.claude/

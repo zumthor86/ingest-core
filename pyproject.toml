@@ -17,6 +17,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+# Optional, not required: the ThetaData client pulls gRPC + zstandard, and only the
+# options consumer (Hephaestus) imports it. Hermes installs ingest-core for the EODHD
+# price path and has no use for either. clients/thetadata.py imports the package
+# lazily and raises a message naming this extra, so a missing install fails legibly
+# instead of at import time.
+thetadata = ["thetadata"]
 
 [build-system]
 requires = ["setuptools>=61.0"]

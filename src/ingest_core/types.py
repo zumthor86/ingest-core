@@ -58,6 +58,38 @@ class EODHDServerError(EODHDLimitError):
     """
 
 
+class ThetaDataError(RuntimeError):
+    """Base: ThetaData declined to serve the request.
+
+    Deliberately *not* a subclass of :class:`EODHDLimitError`. The two vendors
+    fail in unrelated ways and a shared base would invite exactly the kind of
+    catch-all handling that let EODHD's vendor 500s masquerade as quota
+    exhaustion. Callers deciding whether work was deferred or failed branch on
+    the subclasses below — never on message text.
+    """
+
+
+class ThetaDataPermissionError(ThetaDataError):
+    """gRPC ``PERMISSION_DENIED`` — the subscription tier does not cover this request.
+
+    Two distinct causes share this code and neither is retryable within a run:
+    an endpoint above the current tier (greeks on Value), and a date older than
+    the tier's history floor. Both are configuration facts, not transient
+    conditions, so a caller must surface them rather than defer them — a run that
+    quietly defers every request because the subscription lapsed would report a
+    coverage shortfall with no indication of why.
+    """
+
+
+class ThetaDataTransientError(ThetaDataError):
+    """A vendor-side or transport fault that retrying can plausibly fix.
+
+    ``UNAVAILABLE``, ``DEADLINE_EXCEEDED``, ``INTERNAL``, ``RESOURCE_EXHAUSTED``.
+    Unlike EODHD there is no metered call budget behind these, so a retry costs
+    only wall-clock time.
+    """
+
+
 @dataclass(frozen=True)
 class EODHDPage:
     """One decoded provider page + pagination cursor."""
