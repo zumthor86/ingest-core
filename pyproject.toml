@@ -23,6 +23,9 @@ dev = ["pytest"]
 # lazily and raises a message naming this extra, so a missing install fails legibly
 # instead of at import time.
 thetadata = ["thetadata"]
+# Same pattern for Databento: only the intraday bar producer (Hermes, feeding store_core.BarStore)
+# needs it, and clients/databento.py imports it lazily.
+databento = ["databento"]
 
 [build-system]
 requires = ["setuptools>=61.0"]
