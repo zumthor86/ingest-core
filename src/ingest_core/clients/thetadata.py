@@ -34,7 +34,7 @@ import random
 import threading
 import time
 from datetime import date
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import polars as pl
 
