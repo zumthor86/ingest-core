@@ -7,6 +7,7 @@ by *resolved* calendar objects (a ``pandas_market_calendars`` calendar and/or a
 """
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Optional
 
@@ -16,6 +17,9 @@ import pandas_market_calendars as mcal
 # ---------------------------------------------------------------------------
 # Gap detection (promoted from Hermes io/ingest/eodhd/calendar.py)
 # ---------------------------------------------------------------------------
+
+
+logger = logging.getLogger(__name__)
 
 
 def parse_iso_date(value: str | date | None) -> Optional[date]:
@@ -36,6 +40,7 @@ def _pmc_calendar_has_holidays_for_year(calendar, year: int) -> bool:
     try:
         holiday_dates = calendar.holidays().holidays
     except Exception:
+        logger.debug("calendar has no readable holiday list; it is taken as complete", exc_info=True)
         return True
     year_str = str(year)
     return any(str(d).startswith(year_str) for d in holiday_dates)
@@ -61,6 +66,7 @@ def trading_days_between(
         try:
             schedule = market_calendar.schedule(start_date=start_date, end_date=end_date)
         except Exception:
+            logger.warning("market calendar schedule failed for %s to %s; weekdays are used", start_date, end_date, exc_info=True)
             schedule = None
         if schedule is not None:
             if schedule.empty:
@@ -263,12 +269,13 @@ def get_early_close_sessions_set(
         early = calendar.early_closes(schedule)
         return {ts.date() for ts in early.index}
     except Exception:
+        logger.debug("early_closes failed; a close before 16:00 local counts as early", exc_info=True)
         # Fallback: a close before 16:00 exchange-local time is an early close.
         if "market_close" not in schedule.columns:
             return set()
         tz = getattr(calendar, "tz", "America/New_York")
         local_close = schedule["market_close"].dt.tz_convert(tz)
-        return {ts.date() for ts, hour in zip(schedule.index, local_close.dt.hour) if hour < 16}
+        return {ts.date() for ts, hour in zip(schedule.index, local_close.dt.hour, strict=True) if hour < 16}
 
 
 def last_completed_session(

@@ -586,7 +586,7 @@ def _normalize_eod_records(
                 records.append(dict(record))
             continue
         if isinstance(record, list) and fields:
-            records.append(dict(zip(fields, record)))
+            records.append(dict(zip(fields, record, strict=False)))
     return records
 
 
@@ -713,7 +713,7 @@ def fetch_eodhd_contract_snapshot(
 def _payload_summary(payload: Any, max_length: int = 200) -> str:
     try:
         rendered = str(payload)
-    except Exception:
+    except Exception:  # noqa: BLE001 - a payload whose str() raises still needs a summary
         return "<unprintable payload>"
     rendered = re.sub(r"\s+", " ", rendered).strip()
     if len(rendered) <= max_length:
@@ -746,7 +746,7 @@ def _decode_eodhd_payload(resp: requests.Response, request_label: str) -> Any:
         if _is_limit_message(response_text):
             raise EODHDLimitError(
                 f"EODHD rejected request for {request_label}: {_payload_summary(response_text)}"
-            )
+            ) from None
         raise
     if isinstance(payload, dict):
         summary = _payload_summary(payload)
@@ -860,7 +860,7 @@ def fetch_bulk_eod_for_exchange(
     except EODHDLimitError:
         raise
     except Exception as exc:
-        _logger.warning("fetch_bulk_eod_for_exchange %s (%s): %s", exchange_code, date_str, exc)
+        _logger.warning("fetch_bulk_eod_for_exchange %s (%s): %s", exchange_code, date_str, exc, exc_info=True)
         return pd.DataFrame()
 
 
@@ -889,7 +889,7 @@ def fetch_exchange_catalog(api_key: str = "") -> list[dict[str, Any]]:
     except EODHDLimitError:
         raise
     except Exception as exc:
-        _logger.error("Failed to fetch EODHD exchange list: %s", exc)
+        _logger.error("Failed to fetch EODHD exchange list: %s", exc, exc_info=True)
         return []
 
 
@@ -922,7 +922,7 @@ def fetch_exchange_symbol_list(exchange_code: str, api_key: str = "") -> list[di
     except EODHDLimitError:
         raise
     except Exception as exc:
-        _logger.warning("Failed to fetch symbol list for exchange %s: %s", exchange_code, exc)
+        _logger.warning("Failed to fetch symbol list for exchange %s: %s", exchange_code, exc, exc_info=True)
         return []
 
 

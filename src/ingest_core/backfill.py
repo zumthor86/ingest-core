@@ -289,7 +289,7 @@ def quota_remaining_requests(api_token: Optional[str] = None) -> Optional[int]:
         from ingest_core.clients.eodhd import get_eodhd_quota_status
 
         return int(get_eodhd_quota_status(api_token=api_token)["marketplace_requests_remaining"])
-    except Exception:
+    except Exception:  # noqa: BLE001 - an unreadable quota means unknown, and the caller handles None
         return None
 
 

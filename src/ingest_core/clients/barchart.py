@@ -213,7 +213,7 @@ def _get_cookie_value(session: requests.Session, name: str) -> Optional[str]:
         for c in session.cookies:
             if c.name == name and c.value:
                 return c.value
-    except Exception:
+    except (AttributeError, TypeError):
         return None
     return None
 
@@ -225,7 +225,7 @@ def _xsrf_header(session: requests.Session) -> Optional[dict]:
     # Some frameworks require unquoted token value
     try:
         decoded = unquote(token)
-    except Exception:
+    except (AttributeError, TypeError):
         decoded = token
     return {"X-XSRF-TOKEN": decoded}
 
@@ -283,7 +283,7 @@ def _try_core_api(session: requests.Session, timeout: int = 25) -> Optional[pl.D
     try:
         r = session.get(url, headers=headers, timeout=timeout)
     except Exception as e:
-        logger.warning("barchart.fetch: core_api_json request error: %s", e)
+        logger.warning("barchart.fetch: core_api_json request error: %s", e, exc_info=True)
         return None
     if r.status_code != 200:
         logger.warning(
@@ -294,7 +294,7 @@ def _try_core_api(session: requests.Session, timeout: int = 25) -> Optional[pl.D
     try:
         js = r.json()
     except Exception as e:
-        logger.warning("barchart.fetch: core_api_json non-JSON body=%r err=%s", r.text[:200], e)
+        logger.warning("barchart.fetch: core_api_json non-JSON body=%r err=%s", r.text[:200], e, exc_info=True)
         return None
     data = js.get("data") if isinstance(js, dict) else None
     if not isinstance(data, list) or not data:
@@ -326,7 +326,7 @@ def fetch_most_active_options(
     try:
         sess.get(url, headers=_std_headers(), timeout=timeout)
     except Exception as e:
-        logger.warning("barchart.fetch: page GET to seed cookies failed: %s", e)
+        logger.warning("barchart.fetch: page GET to seed cookies failed: %s", e, exc_info=True)
         return pl.DataFrame()
     df_pl = _try_core_api(sess, timeout=timeout)
     if df_pl is None or df_pl.is_empty():
@@ -461,7 +461,7 @@ def _try_r1000_core_api(
         try:
             resp = session.get(url, headers=headers, timeout=timeout)
         except Exception as e:
-            logger.warning("barchart.r1000: core_api page=%d request error: %s", page, e)
+            logger.warning("barchart.r1000: core_api page=%d request error: %s", page, e, exc_info=True)
             return None
         if resp.status_code != 200:
             logger.warning(
@@ -474,7 +474,7 @@ def _try_r1000_core_api(
         try:
             js = resp.json()
         except Exception as e:
-            logger.warning("barchart.r1000: core_api page=%d non-JSON body=%r err=%s", page, resp.text[:200], e)
+            logger.warning("barchart.r1000: core_api page=%d non-JSON body=%r err=%s", page, resp.text[:200], e, exc_info=True)
             return None
 
         data = js.get("data") if isinstance(js, dict) else None
@@ -539,7 +539,7 @@ def fetch_russell1000_constituents(
         r = sess.get(url, headers=_std_headers(), timeout=timeout)
         r.raise_for_status()
     except Exception as e:
-        logger.error(f"barchart.r1000: failed to fetch page: {e}")
+        logger.error(f"barchart.r1000: failed to fetch page: {e}", exc_info=True)
         return pl.DataFrame(), []
 
     result = _try_r1000_core_api(
@@ -562,6 +562,6 @@ def _extract_view_name(u: str) -> Optional[str]:
         v = q.get("viewName") or q.get("view") or q.get("viewId")
         if v and isinstance(v, list) and v[0]:
             return v[0]
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         return None
     return None
