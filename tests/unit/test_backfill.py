@@ -54,6 +54,7 @@ def test_budget_thread_safe():
     threads = [threading.Thread(target=spin) for _ in range(8)]
     [t.start() for t in threads]
     [t.join() for t in threads]
+    assert b.requests == 8000
 
 
 def test_budget_try_reserve_is_all_or_nothing():
@@ -283,9 +284,11 @@ def test_quota_remaining_requests_none_on_error(monkeypatch):
     assert quota_remaining_requests() is None
 
 
-def test_probe_quota_reset_swallows_errors(monkeypatch):
+def test_probe_quota_reset_swallows_errors(monkeypatch, caplog):
     def boom(url, api_token=None):
         raise RuntimeError("out of quota")
 
     monkeypatch.setattr("ingest_core.backfill.fetch_eodhd_page", boom)
-    probe_quota_reset()  # must not raise
+    with caplog.at_level("WARNING"):
+        probe_quota_reset()  # must not raise
+    assert "quota probe request failed" in caplog.text
