@@ -817,51 +817,50 @@ def fetch_bulk_eod_for_exchange(
     date_str: str,
     api_key: str = "",
 ) -> pd.DataFrame:
+    """One exchange's bars for one date.
+
+    An empty frame means the vendor has no bars for that date (HTTP 404, an empty list) or no
+    API key is set. A request that fails raises, so a caller cannot read it as a closed market.
+    """
     key = api_key or os.environ.get("EODHD_API_KEY", "")
     if not key:
         return pd.DataFrame()
-    try:
-        resp = requests.get(
-            f"{_EODHD_BASE}/eod-bulk-last-day/{exchange_code}",
-            params={"api_token": key, "date": date_str, "fmt": "json"},
-            timeout=60,
-        )
-        if resp.status_code == 404:
-            _logger.debug("fetch_bulk_eod_for_exchange: 404 for %s on %s", exchange_code, date_str)
-            return pd.DataFrame()
-        if resp.status_code == 429:
-            raise EODHDThrottleError(
-                f"EODHD throttled bulk request for {exchange_code} on {date_str}: HTTP 429"
-            )
-        resp.raise_for_status()
-        data = _decode_eodhd_payload(resp, f"{exchange_code} on {date_str}")
-        if isinstance(data, dict):
-            _logger.warning(
-                "fetch_bulk_eod_for_exchange %s (%s): unexpected payload: %s",
-                exchange_code, date_str, _payload_summary(data),
-            )
-            return pd.DataFrame()
-        if not isinstance(data, list) or not data:
-            return pd.DataFrame()
-        df = pd.DataFrame(data)
-        if "code" in df.columns:
-            df = df.rename(columns={"code": "symbol"})
-        df["symbol"] = df["symbol"].str.upper()
-        df["exchange"] = exchange_code
-        if "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"]).dt.date
-        keep = EOD_COLS + ["symbol", "exchange"]
-        df = df[[c for c in keep if c in df.columns]]
-        for col in OHLCV_FLOAT_COLS:
-            if col in df.columns:
-                df[col] = df[col].astype("float64")
-        _logger.debug("fetch_bulk_eod_for_exchange: %s on %s → %d rows", exchange_code, date_str, len(df))
-        return df
-    except EODHDLimitError:
-        raise
-    except Exception as exc:
-        _logger.warning("fetch_bulk_eod_for_exchange %s (%s): %s", exchange_code, date_str, exc, exc_info=True)
+    resp = requests.get(
+        f"{_EODHD_BASE}/eod-bulk-last-day/{exchange_code}",
+        params={"api_token": key, "date": date_str, "fmt": "json"},
+        timeout=60,
+    )
+    if resp.status_code == 404:
+        _logger.debug("fetch_bulk_eod_for_exchange: 404 for %s on %s", exchange_code, date_str)
         return pd.DataFrame()
+    if resp.status_code == 429:
+        raise EODHDThrottleError(
+            f"EODHD throttled bulk request for {exchange_code} on {date_str}: HTTP 429"
+        )
+    resp.raise_for_status()
+    data = _decode_eodhd_payload(resp, f"{exchange_code} on {date_str}")
+    if isinstance(data, dict):
+        _logger.warning(
+            "fetch_bulk_eod_for_exchange %s (%s): unexpected payload: %s",
+            exchange_code, date_str, _payload_summary(data),
+        )
+        return pd.DataFrame()
+    if not isinstance(data, list) or not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data)
+    if "code" in df.columns:
+        df = df.rename(columns={"code": "symbol"})
+    df["symbol"] = df["symbol"].str.upper()
+    df["exchange"] = exchange_code
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+    keep = EOD_COLS + ["symbol", "exchange"]
+    df = df[[c for c in keep if c in df.columns]]
+    for col in OHLCV_FLOAT_COLS:
+        if col in df.columns:
+            df[col] = df[col].astype("float64")
+    _logger.debug("fetch_bulk_eod_for_exchange: %s on %s → %d rows", exchange_code, date_str, len(df))
+    return df
 
 
 def fetch_exchange_catalog(api_key: str = "") -> list[dict[str, Any]]:

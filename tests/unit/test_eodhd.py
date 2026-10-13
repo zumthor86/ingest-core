@@ -426,3 +426,26 @@ def test_sustained_5xx_collapses_the_live_limit_toward_the_floor():
         gate.on_congestion("HTTP 500")
 
     assert gate._limit == 2, "a sustained 500 wave must drive concurrency to the floor"
+
+
+def test_fetch_bulk_raises_when_the_request_fails(monkeypatch):
+    """A failed request is not a closed market: the caller must be able to tell them apart."""
+    import requests
+
+    def refused(*a, **k):
+        raise requests.ConnectionError("connection refused")
+
+    monkeypatch.setattr("ingest_core.clients.eodhd.requests.get", refused)
+    with pytest.raises(requests.ConnectionError):
+        fetch_bulk_eod_for_exchange("US", "2026-05-01", api_key="tok")
+
+    monkeypatch.setattr("ingest_core.clients.eodhd.requests.get", lambda *a, **k: _FakeResponse(status_code=500))
+    with pytest.raises(requests.HTTPError):
+        fetch_bulk_eod_for_exchange("US", "2026-05-01", api_key="tok")
+
+
+def test_fetch_bulk_is_empty_when_the_vendor_has_no_bars(monkeypatch):
+    monkeypatch.setattr("ingest_core.clients.eodhd.requests.get", lambda *a, **k: _FakeResponse(status_code=404))
+    assert fetch_bulk_eod_for_exchange("US", "2026-05-01", api_key="tok").empty
+    monkeypatch.setattr("ingest_core.clients.eodhd.requests.get", lambda *a, **k: _FakeResponse(payload=[]))
+    assert fetch_bulk_eod_for_exchange("US", "2026-05-01", api_key="tok").empty
