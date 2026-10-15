@@ -819,8 +819,6 @@ def fetch_bulk_corporate_actions(exchange_code: str, date_str: str, kind: str, a
     (the vendor's value, as a float) or ``split`` (the vendor's ``"new/old"`` text). An empty frame means the vendor
     lists none that day. A request that fails, or a missing API key, raises: no list must never read as "none".
     """
-    import polars as pl
-
     if kind not in ("dividends", "splits"):
         raise ValueError(f"kind must be 'dividends' or 'splits', not {kind!r}")
     key = api_key or os.environ.get("EODHD_API_KEY", "")
@@ -837,12 +835,18 @@ def fetch_bulk_corporate_actions(exchange_code: str, date_str: str, kind: str, a
     data = _decode_eodhd_payload(resp, f"{kind} {exchange_code} on {date_str}")
     if not isinstance(data, list):
         raise RuntimeError(f"{kind} list for {exchange_code} on {date_str}: unexpected payload {_payload_summary(data)}")
-    value_col = "dividend" if kind == "dividends" else "split"
-    schema = {"symbol": pl.Utf8, "exchange": pl.Utf8, "ex_date": pl.Date,
-              value_col: pl.Float64 if kind == "dividends" else pl.Utf8}
-    rows = [{"symbol": str(r["code"]).upper(), "exchange": exchange_code,
-             "ex_date": date.fromisoformat(r["date"]),
-             value_col: float(r[value_col]) if kind == "dividends" else str(r[value_col])}
+    return _corporate_action_frame(data, exchange_code, kind)
+
+
+def _corporate_action_frame(data: list, exchange_code: str, kind: str):
+    import polars as pl
+
+    dividends = kind == "dividends"
+    value_col = "dividend" if dividends else "split"
+    schema = {"symbol": pl.Utf8, "exchange": pl.Utf8, "ex_date": pl.Date, value_col: pl.Float64 if dividends else pl.Utf8}
+    convert = float if dividends else str
+    rows = [{"symbol": str(r["code"]).upper(), "exchange": exchange_code, "ex_date": date.fromisoformat(r["date"]),
+             value_col: convert(r[value_col])}
             for r in data if r.get("code") and r.get("date") and r.get(value_col) not in (None, "")]
     return pl.DataFrame(rows, schema=schema)
 
