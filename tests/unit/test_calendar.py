@@ -74,3 +74,22 @@ def test_nyse_early_close_characterization():
     assert sorted(get_early_close_sessions_set(date(2025, 11, 24), date(2025, 11, 30))) == [
         date(2025, 11, 28)
     ]
+
+
+def test_interior_gaps_finds_holes_inside_the_series_only():
+    import pandas_market_calendars as mcal
+
+    from ingest_core.calendar import interior_gaps
+
+    nyse = mcal.get_calendar("NYSE")
+    held = [date(2026, 3, 5), date(2026, 3, 6), date(2026, 3, 10), date(2026, 3, 11), date(2026, 3, 16)]
+    assert interior_gaps(held, market_calendar=nyse) == [
+        date(2026, 3, 9), date(2026, 3, 12), date(2026, 3, 13)]
+    # A narrower window keeps only the holes inside it; it never reaches past the series' ends.
+    assert interior_gaps(held, start=date(2026, 3, 11), market_calendar=nyse) == [
+        date(2026, 3, 12), date(2026, 3, 13)]
+    assert interior_gaps(held, start=date(2026, 1, 1), end=date(2026, 12, 31), market_calendar=nyse) == [
+        date(2026, 3, 9), date(2026, 3, 12), date(2026, 3, 13)]
+    assert interior_gaps([], market_calendar=nyse) == []
+    # Good Friday 2026-04-03 is not a session, so it is not a gap.
+    assert interior_gaps([date(2026, 4, 2), date(2026, 4, 6)], market_calendar=nyse) == []

@@ -449,3 +449,34 @@ def test_fetch_bulk_is_empty_when_the_vendor_has_no_bars(monkeypatch):
     assert fetch_bulk_eod_for_exchange("US", "2026-05-01", api_key="tok").empty
     monkeypatch.setattr("ingest_core.clients.eodhd.requests.get", lambda *a, **k: _FakeResponse(payload=[]))
     assert fetch_bulk_eod_for_exchange("US", "2026-05-01", api_key="tok").empty
+
+
+def test_fetch_bulk_corporate_actions_parses_dividends_and_splits(monkeypatch):
+    from datetime import date
+
+    div = [{"code": "rexr", "exchange": "US", "date": "2026-09-30", "dividend": "0.43500"},
+           {"code": "X", "exchange": "US", "date": "2026-09-30", "dividend": ""}]
+    monkeypatch.setattr(eodhd.requests, "get", lambda *a, **k: _FakeResponse(payload=div))
+    d = eodhd.fetch_bulk_corporate_actions("US", "2026-09-30", "dividends", api_key="k")
+    assert d.to_dicts() == [{"symbol": "REXR", "exchange": "US", "ex_date": date(2026, 9, 30), "dividend": 0.435}]
+
+    spl = [{"code": "IBO", "exchange": "US", "date": "2026-09-23", "split": "79.000000/1000.000000"}]
+    monkeypatch.setattr(eodhd.requests, "get", lambda *a, **k: _FakeResponse(payload=spl))
+    s = eodhd.fetch_bulk_corporate_actions("US", "2026-09-23", "splits", api_key="k")
+    assert s["split"].to_list() == ["79.000000/1000.000000"]
+
+    monkeypatch.setattr(eodhd.requests, "get", lambda *a, **k: _FakeResponse(payload=[]))
+    assert eodhd.fetch_bulk_corporate_actions("US", "2026-09-27", "splits", api_key="k").is_empty()
+
+
+def test_fetch_bulk_corporate_actions_fails_closed(monkeypatch):
+    import requests
+
+    monkeypatch.setattr(eodhd.requests, "get", lambda *a, **k: _FakeResponse(status_code=500))
+    with pytest.raises(requests.HTTPError):
+        eodhd.fetch_bulk_corporate_actions("US", "2026-09-30", "dividends", api_key="k")
+    monkeypatch.setattr(eodhd.requests, "get", lambda *a, **k: _FakeResponse(payload={"error": "odd"}))
+    with pytest.raises(RuntimeError):
+        eodhd.fetch_bulk_corporate_actions("US", "2026-09-30", "dividends", api_key="k")
+    with pytest.raises(ValueError):
+        eodhd.fetch_bulk_corporate_actions("US", "2026-09-30", "earnings", api_key="k")

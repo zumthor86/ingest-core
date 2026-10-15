@@ -118,6 +118,36 @@ def missing_trading_days(
     )
 
 
+def interior_gaps(
+    held: Iterable[date],
+    *,
+    start: str | date | None = None,
+    end: str | date | None = None,
+    market_calendar=None,
+    country_cal=None,
+) -> list[date]:
+    """Sessions a series does not hold between its first and last held date.
+
+    ``missing_trading_days`` looks only past a watermark; a session missing in the middle of a
+    series is never seen by it again. ``start`` / ``end`` narrow the window (a recent lookback);
+    they never widen it past the series' own first and last date, so a listing's start and its
+    newest session are not reported as gaps.
+    """
+    have = {parse_iso_date(d) for d in held}
+    have.discard(None)
+    if not have:
+        return []
+    lo, hi = min(have), max(have)
+    if start is not None:
+        lo = max(lo, parse_iso_date(start))
+    if end is not None:
+        hi = min(hi, parse_iso_date(end))
+    if lo > hi:
+        return []
+    sessions = trading_days_between(lo, hi, market_calendar=market_calendar, country_cal=country_cal)
+    return [d for d in sessions if d not in have]
+
+
 def collapse_to_ranges(
     missing_dates: list[date],
     *,

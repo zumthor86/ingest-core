@@ -812,6 +812,41 @@ def fetch_eod(
     return df
 
 
+def fetch_bulk_corporate_actions(exchange_code: str, date_str: str, kind: str, api_key: str = ""):
+    """One exchange's dividends or splits with ex-date ``date_str``, as a Polars frame.
+
+    ``kind`` is ``"dividends"`` or ``"splits"``. Columns: ``symbol``, ``exchange``, ``ex_date``, and ``dividend``
+    (the vendor's value, as a float) or ``split`` (the vendor's ``"new/old"`` text). An empty frame means the vendor
+    lists none that day. A request that fails, or a missing API key, raises: no list must never read as "none".
+    """
+    import polars as pl
+
+    if kind not in ("dividends", "splits"):
+        raise ValueError(f"kind must be 'dividends' or 'splits', not {kind!r}")
+    key = api_key or os.environ.get("EODHD_API_KEY", "")
+    if not key:
+        raise RuntimeError("EODHD_API_KEY is not set")
+    resp = requests.get(
+        f"{_EODHD_BASE}/eod-bulk-last-day/{exchange_code}",
+        params={"api_token": key, "type": kind, "date": date_str, "fmt": "json"},
+        timeout=60,
+    )
+    if resp.status_code >= 400 and resp.status_code not in (402, 403, 429):
+        resp.raise_for_status()
+    # 402/403/429 become the module's quota, limit and throttle errors here.
+    data = _decode_eodhd_payload(resp, f"{kind} {exchange_code} on {date_str}")
+    if not isinstance(data, list):
+        raise RuntimeError(f"{kind} list for {exchange_code} on {date_str}: unexpected payload {_payload_summary(data)}")
+    value_col = "dividend" if kind == "dividends" else "split"
+    schema = {"symbol": pl.Utf8, "exchange": pl.Utf8, "ex_date": pl.Date,
+              value_col: pl.Float64 if kind == "dividends" else pl.Utf8}
+    rows = [{"symbol": str(r["code"]).upper(), "exchange": exchange_code,
+             "ex_date": date.fromisoformat(r["date"]),
+             value_col: float(r[value_col]) if kind == "dividends" else str(r[value_col])}
+            for r in data if r.get("code") and r.get("date") and r.get(value_col) not in (None, "")]
+    return pl.DataFrame(rows, schema=schema)
+
+
 def fetch_bulk_eod_for_exchange(
     exchange_code: str,
     date_str: str,
