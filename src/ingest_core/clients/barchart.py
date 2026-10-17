@@ -433,6 +433,66 @@ def _clean_r1000_df(
         return df
 
 
+def _r1000_page(session: requests.Session, headers: dict, page: int, timeout: int) -> Optional[Dict[str, Any]]:
+    """One page's JSON body with a ``data`` list, or None (logged) when the page cannot be read."""
+    url = (
+        f"{_BARCHART_CORE_API_URL}?list=stocks.markets.russell1000"
+        f"&fields={_R1000_CORE_API_FIELDS}"
+        f"&orderBy=symbol&orderDir=asc&limit={_R1000_CORE_API_LIMIT}&page={page}"
+    )
+    try:
+        resp = session.get(url, headers=headers, timeout=timeout)
+    except Exception as e:
+        logger.warning("barchart.r1000: core_api page=%d request error: %s", page, e, exc_info=True)
+        return None
+    if resp.status_code != 200:
+        logger.warning(
+            "barchart.r1000: core_api page=%d status=%s body=%r",
+            page,
+            resp.status_code,
+            resp.text[:200],
+        )
+        return None
+    try:
+        js = resp.json()
+    except Exception as e:
+        logger.warning("barchart.r1000: core_api page=%d non-JSON body=%r err=%s", page, resp.text[:200], e, exc_info=True)
+        return None
+    if not isinstance(js, dict) or not isinstance(js.get("data"), list):
+        logger.warning("barchart.r1000: core_api page=%d missing data payload", page)
+        return None
+    return js
+
+
+def _stated_total(js: Dict[str, Any]) -> Optional[int]:
+    try:
+        return int(js["total"]) if js.get("total") is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _r1000_rows(session: requests.Session, headers: dict, timeout: int) -> Optional[List[Dict[str, Any]]]:
+    """Every row of the list, page by page; None when any page fails."""
+    rows: List[Dict[str, Any]] = []
+    page = 1
+    total: Optional[int] = None
+    while True:
+        js = _r1000_page(session, headers, page, timeout)
+        if js is None:
+            return None
+        data = js["data"]
+        if not data:
+            return rows
+        rows.extend(item for item in data if isinstance(item, dict))
+        logger.debug("barchart.r1000: core_api page=%d fetched=%d count=%s total=%s",
+                     page, len(data), js.get("count"), js.get("total"))
+        if total is None:
+            total = _stated_total(js)
+        if (total is not None and len(rows) >= total) or len(data) < _R1000_CORE_API_LIMIT:
+            return rows
+        page += 1
+
+
 def _try_r1000_core_api(
     session: requests.Session,
     referer_url: str,
@@ -448,63 +508,7 @@ def _try_r1000_core_api(
     if xsrf:
         headers.update(xsrf)
 
-    rows: List[Dict[str, Any]] = []
-    page = 1
-    total: Optional[int] = None
-
-    while True:
-        url = (
-            f"{_BARCHART_CORE_API_URL}?list=stocks.markets.russell1000"
-            f"&fields={_R1000_CORE_API_FIELDS}"
-            f"&orderBy=symbol&orderDir=asc&limit={_R1000_CORE_API_LIMIT}&page={page}"
-        )
-        try:
-            resp = session.get(url, headers=headers, timeout=timeout)
-        except Exception as e:
-            logger.warning("barchart.r1000: core_api page=%d request error: %s", page, e, exc_info=True)
-            return None
-        if resp.status_code != 200:
-            logger.warning(
-                "barchart.r1000: core_api page=%d status=%s body=%r",
-                page,
-                resp.status_code,
-                resp.text[:200],
-            )
-            return None
-        try:
-            js = resp.json()
-        except Exception as e:
-            logger.warning("barchart.r1000: core_api page=%d non-JSON body=%r err=%s", page, resp.text[:200], e, exc_info=True)
-            return None
-
-        data = js.get("data") if isinstance(js, dict) else None
-        if not isinstance(data, list):
-            logger.warning("barchart.r1000: core_api page=%d missing data payload", page)
-            return None
-        if not data:
-            break
-
-        rows.extend(item for item in data if isinstance(item, dict))
-        logger.debug(
-            "barchart.r1000: core_api page=%d fetched=%d count=%s total=%s",
-            page,
-            len(data),
-            js.get("count") if isinstance(js, dict) else None,
-            js.get("total") if isinstance(js, dict) else None,
-        )
-
-        if total is None and isinstance(js, dict):
-            try:
-                total = int(js.get("total")) if js.get("total") is not None else None
-            except (TypeError, ValueError):
-                total = None
-
-        if total is not None and len(rows) >= total:
-            break
-        if len(data) < _R1000_CORE_API_LIMIT:
-            break
-        page += 1
-
+    rows = _r1000_rows(session, headers, timeout)
     if not rows:
         return None
 

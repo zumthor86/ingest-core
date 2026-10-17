@@ -69,3 +69,73 @@ def test_apply_symbol_mappings_injected_dict():
     assert out["symbol"].to_list() == ["BRK-B", "AAPL"]
     # no-op without mappings
     assert _apply_symbol_mappings(df, None)["symbol"].to_list() == ["BRK.B", "AAPL"]
+
+
+# ---- the Russell 1000 core-api pager
+
+
+class _Resp:
+    def __init__(self, status=200, body=None, text=""):
+        self.status_code, self._body, self.text = status, body, text
+
+    def json(self):
+        if isinstance(self._body, Exception):
+            raise self._body
+        return self._body
+
+
+class _Session:
+    """Answers each GET with the next response, and remembers the page numbers asked for."""
+
+    def __init__(self, responses):
+        self.responses, self.pages, self.cookies = list(responses), [], []
+
+    def get(self, url, headers=None, timeout=None):
+        self.pages.append(int(url.rsplit("page=", 1)[1]))
+        nxt = self.responses.pop(0)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
+
+def _rows(*symbols):
+    return [{"symbol": s, "symbolName": f"{s} Inc", "marketCap": "1,000"} for s in symbols]
+
+
+@pytest.fixture
+def small_pages(monkeypatch):
+    from ingest_core.clients import barchart
+    monkeypatch.setattr(barchart, "_R1000_CORE_API_LIMIT", 2)
+    return barchart
+
+
+def test_r1000_pages_until_a_short_page(small_pages):
+    s = _Session([_Resp(body={"data": _rows("AAA", "BBB")}), _Resp(body={"data": _rows("CCC")})])
+    df, rows = small_pages._try_r1000_core_api(s, "https://ref")
+    assert s.pages == [1, 2] and len(rows) == 3
+    assert sorted(df["symbol"].to_list()) == ["AAA", "BBB", "CCC"] and "Name" in df.columns
+
+
+def test_r1000_stops_at_the_stated_total(small_pages):
+    s = _Session([_Resp(body={"data": _rows("AAA", "BBB"), "total": "2"})])
+    _, rows = small_pages._try_r1000_core_api(s, "https://ref")
+    assert s.pages == [1] and len(rows) == 2
+
+
+def test_r1000_stops_at_an_empty_page_and_ignores_a_bad_total(small_pages):
+    s = _Session([_Resp(body={"data": _rows("AAA", "BBB"), "total": "many"}), _Resp(body={"data": []})])
+    _, rows = small_pages._try_r1000_core_api(s, "https://ref")
+    assert s.pages == [1, 2] and len(rows) == 2
+
+
+@pytest.mark.parametrize("answer", [
+    RuntimeError("refused"), _Resp(status=403, text="blocked"), _Resp(body=ValueError("not json")),
+    _Resp(body={"nodata": 1}), _Resp(body=["not", "a", "dict"]), _Resp(body={"data": []}),
+])
+def test_r1000_any_failure_or_no_rows_is_none(small_pages, answer):
+    assert small_pages._try_r1000_core_api(_Session([answer]), "https://ref") is None
+
+
+def test_r1000_a_failure_on_a_later_page_drops_the_earlier_pages(small_pages):
+    s = _Session([_Resp(body={"data": _rows("AAA", "BBB")}), _Resp(status=500)])
+    assert small_pages._try_r1000_core_api(s, "https://ref") is None
