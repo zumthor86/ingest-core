@@ -71,6 +71,29 @@ def download(hist, req: dict, path: Path) -> int:
     return path.stat().st_size
 
 
+DEFINITION_COLUMNS = ["instrument_id", "raw_symbol", "asset", "expiration", "maturity_year", "maturity_month"]
+
+
+def read_definitions(path: Path) -> pl.DataFrame:
+    """Outright futures in a DBN ``definition`` file, one row per instrument:
+    ``[instrument_id, raw_symbol, asset, expiration (UTC date of the last trading time), maturity_year, maturity_month]``.
+
+    Spreads and options in the same file are dropped (``instrument_class`` other than ``F``). The vendor sends every
+    listed instrument once a session, so the same contract repeats; the last record wins."""
+    schema = {"instrument_id": pl.UInt32, "raw_symbol": pl.Utf8, "asset": pl.Utf8, "expiration": pl.Date,
+              "maturity_year": pl.Int32, "maturity_month": pl.Int32}
+    df = _db().DBNStore.from_file(Path(path)).to_df()
+    if df.empty:
+        return pl.DataFrame(schema=schema)
+    df = df[df["instrument_class"] == "F"]
+    if df.empty:
+        return pl.DataFrame(schema=schema)
+    out = pl.from_pandas(df.reset_index(drop=True)[DEFINITION_COLUMNS])
+    return (out.with_columns(pl.col("expiration").dt.convert_time_zone("UTC").dt.date())
+            .select([pl.col(c).cast(t) for c, t in schema.items()])
+            .unique("instrument_id", keep="last", maintain_order=True).sort("expiration", "instrument_id"))
+
+
 def read_bars(path: Path) -> pl.DataFrame:
     """A DBN OHLCV file as ``[ts_event (UTC), instrument_id, open, high, low, close, volume]``."""
     df = _db().DBNStore.from_file(Path(path)).to_df()

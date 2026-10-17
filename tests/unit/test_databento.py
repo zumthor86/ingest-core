@@ -51,3 +51,25 @@ def test_download_lands_only_when_complete(fake_db, tmp_path):
     with pytest.raises(OSError):
         d.download(hist, {"symbols": ["ES.v.0"]}, other)
     assert not other.exists()
+
+
+def test_read_definitions_keeps_outright_futures_once(tmp_path):
+    import pandas as pd
+
+    frame = pd.DataFrame({
+        "instrument_id": [11, 12, 11, 99],
+        "raw_symbol": ["MCLX6", "MCLZ6", "MCLX6", "MCLX6-MCLZ6"],
+        "asset": ["MCL", "MCL", "MCL", "MCL"],
+        "instrument_class": ["F", "F", "F", "S"],
+        "expiration": pd.to_datetime(["2026-10-19 18:30", "2026-11-17 19:30", "2026-10-19 18:30", "2026-10-19 18:30"],
+                                     utc=True),
+        "maturity_year": [2026, 2026, 2026, 2026],
+        "maturity_month": [11, 12, 11, 11],
+    })
+    store = MagicMock()
+    store.to_df.return_value = frame
+    mod = SimpleNamespace(DBNStore=SimpleNamespace(from_file=lambda p: store))
+    with patch.object(d, "_db", return_value=mod):
+        out = d.read_definitions(tmp_path / "x.dbn.zst")
+    assert out["raw_symbol"].to_list() == ["MCLX6", "MCLZ6"]
+    assert str(out["expiration"][0]) == "2026-10-19"
