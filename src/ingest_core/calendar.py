@@ -46,6 +46,28 @@ def _pmc_calendar_has_holidays_for_year(calendar, year: int) -> bool:
     return any(str(d).startswith(year_str) for d in holiday_dates)
 
 
+def _market_calendar_days(start_date: date, end_date: date, market_calendar, country_cal) -> list[date] | None:
+    """Sessions from the market calendar, or None when it cannot give them."""
+    try:
+        schedule = market_calendar.schedule(start_date=start_date, end_date=end_date)
+    except Exception:
+        logger.warning("market calendar schedule failed for %s to %s; weekdays are used", start_date, end_date, exc_info=True)
+        return None
+    if schedule.empty:
+        return []
+    days = [ts.date() for ts in schedule.index.normalize()]
+    if country_cal is None:
+        return days
+    stale_years = _stale_years({start_date.year, end_date.year}, market_calendar)
+    if stale_years:
+        days = [d for d in days if d.year not in stale_years or d not in country_cal]
+    return days
+
+
+def _stale_years(years: set[int], market_calendar) -> set[int]:
+    return {y for y in years if not _pmc_calendar_has_holidays_for_year(market_calendar, y)}
+
+
 def trading_days_between(
     start_date: date,
     end_date: date,
@@ -63,26 +85,8 @@ def trading_days_between(
         return []
 
     if market_calendar is not None:
-        try:
-            schedule = market_calendar.schedule(start_date=start_date, end_date=end_date)
-        except Exception:
-            logger.warning("market calendar schedule failed for %s to %s; weekdays are used", start_date, end_date, exc_info=True)
-            schedule = None
-        if schedule is not None:
-            if schedule.empty:
-                return []
-            days = [ts.date() for ts in schedule.index.normalize()]
-            if country_cal is not None:
-                request_years = {start_date.year, end_date.year}
-                stale_years = {
-                    y for y in request_years
-                    if not _pmc_calendar_has_holidays_for_year(market_calendar, y)
-                }
-                if stale_years:
-                    days = [
-                        d for d in days
-                        if d.year not in stale_years or d not in country_cal
-                    ]
+        days = _market_calendar_days(start_date, end_date, market_calendar, country_cal)
+        if days is not None:
             return days
 
     if country_cal is not None:

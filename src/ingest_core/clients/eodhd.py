@@ -206,6 +206,16 @@ def _resolve_api_token(api_token: Optional[str]) -> str:
     return resolved_token
 
 
+def _retry_after(resp: requests.Response) -> Optional[float]:
+    header = resp.headers.get("Retry-After")
+    return float(header) if header else None
+
+
+def _retry_wait(retry_after: Optional[float], delay: float) -> float:
+    """The vendor's ``Retry-After`` when sent, else the backoff delay plus up to 30% jitter."""
+    return retry_after or delay + random.uniform(0, delay * 0.3)
+
+
 def _get_with_retry(url: str) -> requests.Response:
     """
     GET *url*, retrying on the conditions EODHD documents as retryable.
@@ -243,8 +253,7 @@ def _get_with_retry(url: str) -> requests.Response:
             gate.on_clean_response()
             return resp
 
-        retry_after_hdr = resp.headers.get("Retry-After")
-        retry_after = float(retry_after_hdr) if retry_after_hdr else None
+        retry_after = _retry_after(resp)
 
         if resp.status_code == 402:
             # Daily budget. Resets at midnight GMT (or the marketplace timeToReset),
@@ -270,7 +279,7 @@ def _get_with_retry(url: str) -> requests.Response:
                     f"{remaining}/{limit}): {resp.text[:200]}",
                     retry_after=retry_after,
                 )
-            wait = retry_after or throttle_delay + random.uniform(0, throttle_delay * 0.3)
+            wait = _retry_wait(retry_after, throttle_delay)
             throttle_attempts += 1
             _logger.warning(
                 "[eodhd] HTTP 429 minute-window full (%s/%s left) — retry %d/%d in %.0fs",
@@ -293,7 +302,7 @@ def _get_with_retry(url: str) -> requests.Response:
                     f"— vendor-side fault, no API calls charged: {resp.text[:200]}",
                     retry_after=retry_after,
                 )
-            wait = retry_after or server_delay + random.uniform(0, server_delay * 0.3)
+            wait = _retry_wait(retry_after, server_delay)
             server_attempts += 1
             _logger.warning(
                 "[eodhd] HTTP %s (vendor-side) — retry %d/%d in %.1fs",
@@ -424,24 +433,14 @@ def build_options_eod_url(
         ("sort", sort),
     ]
 
-    if option_type:
-        params.append(("filter[type]", option_type))
-
-    if exp_date_from:
-        params.append(("filter[exp_date_from]", exp_date_from))
-    if exp_date_to:
-        params.append(("filter[exp_date_to]", exp_date_to))
-
+    filters = [("filter[type]", option_type), ("filter[exp_date_from]", exp_date_from),
+               ("filter[exp_date_to]", exp_date_to)]
     if start_date and end_date and start_date == end_date:
-        params.append(("filter[tradetime_eq]", start_date))
+        filters.append(("filter[tradetime_eq]", start_date))
     else:
-        if start_date:
-            params.append(("filter[tradetime_from]", start_date))
-        if end_date:
-            params.append(("filter[tradetime_to]", end_date))
-
-    if fields:
-        params.append(("fields[options-eod]", ",".join(fields)))
+        filters += [("filter[tradetime_from]", start_date), ("filter[tradetime_to]", end_date)]
+    filters.append(("fields[options-eod]", ",".join(fields) if fields else None))
+    params += [(name, value) for name, value in filters if value]
 
     return f"https://eodhd.com/api/mp/unicornbay/options/eod?{urlencode(params)}"
 
@@ -650,20 +649,24 @@ def fetch_eodhd_options(initial_url: str, api_token: Optional[str] = None) -> pl
 
     if not records:
         return pl.DataFrame([])
+    return _options_frame(records)
 
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat(sep=" ")
+    if isinstance(value, date):
+        return value.isoformat()
+    return value
+
+
+def _options_frame(records: List[Dict[str, Any]]) -> pl.DataFrame:
     # Accumulate per column while normalising datetime values — one pass, no
     # intermediate list of dicts.
     cols: dict[str, list] = {}
     for record in records:
         for key, value in record.items():
-            if key not in cols:
-                cols[key] = []
-            if isinstance(value, datetime):
-                cols[key].append(value.isoformat(sep=" "))
-            elif isinstance(value, date):
-                cols[key].append(value.isoformat())
-            else:
-                cols[key].append(value)
+            cols.setdefault(key, []).append(_json_safe(value))
 
     # Build with type inference first (the vendor sometimes returns float values in
     # nominally-integer columns, e.g. open_interest=22.5, which a strict Int64
@@ -780,30 +783,46 @@ def fetch_eod(
         _logger.error("Network error fetching %s: %s", symbol_full, exc)
         return pd.DataFrame()
 
-    if resp.status_code == 404:
-        _logger.warning("%s: 404 not found", symbol_full)
-        return pd.DataFrame()
-    if resp.status_code == 429:
-        raise EODHDThrottleError(f"EODHD throttled request for {symbol_full}: HTTP 429")
-
-    try:
-        resp.raise_for_status()
-    except requests.HTTPError as exc:
-        _logger.error("HTTP error fetching %s: %s", symbol_full, exc)
-        return pd.DataFrame()
-
-    data = _decode_eodhd_payload(resp, symbol_full)
-    if isinstance(data, dict):
-        _logger.warning("%s: unexpected response payload: %s", symbol_full, _payload_summary(data))
-        return pd.DataFrame()
-    if not data:
-        _logger.info("%s: no rows returned for requested range", symbol_full)
+    data = _checked_rows(resp, symbol_full, "", "no rows returned for requested range")
+    if data is None:
         return pd.DataFrame()
 
     df = pd.DataFrame(data)
     df["date"] = pd.to_datetime(df["date"]).dt.date
     df["symbol"] = ticker.upper()
     df["exchange"] = exchange
+    return _typed_bars(df)
+
+
+def _checked_rows(resp: requests.Response, symbol_full: str, name: str, empty: str):
+    """The decoded rows of a per-symbol response, or None (logged) when there are none to use.
+
+    ``name`` goes before the symbol in log lines and messages, e.g. ``"intraday "``. A 429 raises.
+    """
+    if resp.status_code == 404:
+        _logger.warning("%s%s: 404 not found", name, symbol_full)
+        return None
+    if resp.status_code == 429:
+        raise EODHDThrottleError(f"EODHD throttled {name}request for {symbol_full}: HTTP 429")
+
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        _logger.error("HTTP error fetching %s%s: %s", name, symbol_full, exc)
+        return None
+
+    data = _decode_eodhd_payload(resp, f"{name}{symbol_full}")
+    if isinstance(data, dict):
+        _logger.warning("%s%s: unexpected response payload: %s", name, symbol_full, _payload_summary(data))
+        return None
+    if not data:
+        _logger.info("%s%s: %s", name, symbol_full, empty)
+        return None
+    return data
+
+
+def _typed_bars(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep the daily-bar columns and give the price columns float64."""
     keep = EOD_COLS + ["symbol", "exchange"]
     df = df[[c for c in keep if c in df.columns]]
     for col in OHLCV_FLOAT_COLS:
@@ -893,11 +912,7 @@ def fetch_bulk_eod_for_exchange(
     df["exchange"] = exchange_code
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"]).dt.date
-    keep = EOD_COLS + ["symbol", "exchange"]
-    df = df[[c for c in keep if c in df.columns]]
-    for col in OHLCV_FLOAT_COLS:
-        if col in df.columns:
-            df[col] = df[col].astype("float64")
+    df = _typed_bars(df)
     _logger.debug("fetch_bulk_eod_for_exchange: %s on %s → %d rows", exchange_code, date_str, len(df))
     return df
 
@@ -1035,27 +1050,17 @@ def fetch_intraday(
         _logger.error("Network error fetching intraday %s: %s", symbol_full, exc)
         return pd.DataFrame()
 
-    if resp.status_code == 404:
-        _logger.warning("intraday %s: 404 not found", symbol_full)
-        return pd.DataFrame()
-    if resp.status_code == 429:
-        raise EODHDThrottleError(f"EODHD throttled intraday request for {symbol_full}: HTTP 429")
-
-    try:
-        resp.raise_for_status()
-    except requests.HTTPError as exc:
-        _logger.error("HTTP error fetching intraday %s: %s", symbol_full, exc)
+    data = _checked_rows(resp, symbol_full, "intraday ", "no bars returned for requested window")
+    if data is None:
         return pd.DataFrame()
 
-    data = _decode_eodhd_payload(resp, f"intraday {symbol_full}")
-    if isinstance(data, dict):
-        _logger.warning("intraday %s: unexpected response payload: %s", symbol_full, _payload_summary(data))
-        return pd.DataFrame()
-    if not data:
-        _logger.info("intraday %s: no bars returned for requested window", symbol_full)
-        return pd.DataFrame()
+    df = _intraday_frame(pd.DataFrame(data))
+    df["symbol"] = ticker.upper()
+    df["exchange"] = exchange
+    return df
 
-    df = pd.DataFrame(data)
+
+def _intraday_frame(df: pd.DataFrame) -> pd.DataFrame:
     df = df[[c for c in _INTRADAY_COLS if c in df.columns]].copy()
     # EODHD 'datetime' is a UTC string; keep timestamp (int) as the canonical UTC clock.
     if "datetime" in df.columns:
@@ -1063,8 +1068,6 @@ def fetch_intraday(
     for col in _INTRADAY_FLOAT_COLS:
         if col in df.columns:
             df[col] = df[col].astype("float64")
-    df["symbol"] = ticker.upper()
-    df["exchange"] = exchange
     return df
 
 

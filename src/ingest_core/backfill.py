@@ -126,6 +126,14 @@ def pages_for_total(meta: dict, page_limit: int, offset_cap: int) -> Optional[in
     return min(pages, offset_cap // limit + 1)
 
 
+def _reserve_rest_of_slice(budget: Budget, meta: dict, page_limit: int, offset_cap: int) -> Optional[int]:
+    """Pages claimed beyond page 1 (0 when the total is unknown or one page), or None when they do not fit."""
+    total_pages = pages_for_total(meta, page_limit, offset_cap)
+    if total_pages is None or total_pages <= 1:
+        return 0
+    return total_pages - 1 if budget.try_reserve(total_pages - 1) else None
+
+
 def _paginate(
     symbol: str,
     start: date,
@@ -162,12 +170,10 @@ def _paginate(
         if off == 0:
             # Price the rest of the slice once, from the vendor's own record
             # count, and claim it atomically — then page only what we hold.
-            total_pages = pages_for_total(page.get("meta") or {}, page_limit, offset_cap)
-            if total_pages is not None and total_pages > 1:
-                if budget.try_reserve(total_pages - 1):
-                    reserved_ahead = total_pages - 1
-                else:
-                    return out, True  # won't fit — defer the rest of this slice
+            claimed = _reserve_rest_of_slice(budget, page.get("meta") or {}, page_limit, offset_cap)
+            if claimed is None:
+                return out, True  # won't fit — defer the rest of this slice
+            reserved_ahead = claimed
 
         if len(recs) < page_limit:
             budget.refund(reserved_ahead)  # ended early; release the unspent claim

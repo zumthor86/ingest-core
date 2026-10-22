@@ -260,6 +260,26 @@ def _apply_symbol_mappings(
     return df.with_columns(expr.alias("symbol"))
 
 
+def _get_json(session: requests.Session, url: str, headers: dict, timeout: int):
+    """The core-api body as parsed JSON, or None (logged) on a request error, a bad status or a non-JSON body."""
+    try:
+        r = session.get(url, headers=headers, timeout=timeout)
+    except Exception as e:
+        logger.warning("barchart.fetch: core_api_json request error: %s", e, exc_info=True)
+        return None
+    if r.status_code != 200:
+        logger.warning(
+            "barchart.fetch: core_api_json status=%s body=%r",
+            r.status_code, r.text[:200],
+        )
+        return None
+    try:
+        return r.json()
+    except Exception as e:
+        logger.warning("barchart.fetch: core_api_json non-JSON body=%r err=%s", r.text[:200], e, exc_info=True)
+        return None
+
+
 def _try_core_api(session: requests.Session, timeout: int = 25) -> Optional[pl.DataFrame]:
     """Fetch Most Active via the primary core-api list used in practice.
 
@@ -280,28 +300,20 @@ def _try_core_api(session: requests.Session, timeout: int = 25) -> Optional[pl.D
     xsrf = _xsrf_header(session)
     if xsrf:
         headers.update(xsrf)
-    try:
-        r = session.get(url, headers=headers, timeout=timeout)
-    except Exception as e:
-        logger.warning("barchart.fetch: core_api_json request error: %s", e, exc_info=True)
+    js = _get_json(session, url, headers, timeout)
+    if js is None:
         return None
-    if r.status_code != 200:
-        logger.warning(
-            "barchart.fetch: core_api_json status=%s body=%r",
-            r.status_code, r.text[:200],
-        )
-        return None
-    try:
-        js = r.json()
-    except Exception as e:
-        logger.warning("barchart.fetch: core_api_json non-JSON body=%r err=%s", r.text[:200], e, exc_info=True)
-        return None
-    data = js.get("data") if isinstance(js, dict) else None
+    return _core_api_frame(js)
+
+
+def _core_api_frame(js) -> Optional[pl.DataFrame]:
+    """The quote rows of a core-api body as a frame, or None (logged) when it holds none."""
+    body = js if isinstance(js, dict) else {}
+    data = body.get("data")
     if not isinstance(data, list) or not data:
         logger.warning(
             "barchart.fetch: core_api_json empty data count=%s total=%s",
-            js.get("count") if isinstance(js, dict) else None,
-            js.get("total") if isinstance(js, dict) else None,
+            body.get("count"), body.get("total"),
         )
         return None
     rows: List[Dict[str, Any]] = [item for item in data if isinstance(item, dict)]
